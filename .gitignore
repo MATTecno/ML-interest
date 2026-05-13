@@ -1,0 +1,59 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs and local environment
+.env
+.env.*
+*.env
+.venv/
+venv/
+env/
+
+# Local IDE/agent state
+.git/
+.codex
+.agents/
+.claude/settings.local.json
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Runtime logs and temporary files
+*.log
+data/logs/
+data/debug/
+data/alerts/
+data/reports/
+
+# Browser/session state
+data/chrome_profile/
+
+# Tinder captures and personal/runtime datasets
+data/network_capture/
+data/photos/
+data/profiles.csv
+data/review_queue.csv
+data/review_queue.csv.*
+data/photo_deep_feedback.jsonl
+
+# Generated caches, PCA files, and trained local models
+data/*.pkl
+data/*_cache.json
+models/*.pkl
+
+# Keep small/bootstrap data and bundled non-personal model assets
+!data/synthetic.csv
+!data/models/
+!data/models/*.tflite
+!data/models/*.task
+
+# Accidental shell typo artifact
+=2.2.0

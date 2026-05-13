@@ -1,0 +1,394 @@
+preferences:
+  race_affinity:
+    black: 0.12
+  age_range:
+  - 18
+  - 27
+  distance_range_km:
+  - 0
+  - 35
+  distance_soft_max_km: 60
+  preferred_interests:
+  - academia
+  - viagem
+  - música
+  - Leage Of Legends
+  - LOL
+  - videogame
+  - gamer
+  - tecnologia
+  - terapia
+  - barzinho
+  - bar
+  - cervejinha
+  - cerveja
+  - cruzeirense
+  - cruzeiro
+  - sertanejo
+  - violao
+  - pagode
+  - skate
+  - atividade física
+  - atividades físicas
+  - fitness
+  - esporte
+  - esportes
+  - programação
+  - TI
+  - futebol
+  - estádio
+  - torcida
+  positive_bio_keywords:
+  - aventura
+  - viagem
+  - academia
+  - trilha
+  - musica
+  - café
+  - culinária
+  - cinema
+  - série
+  - criativa
+  - espontânea
+  - independente
+  - carro
+  - nerd
+  - programadora
+  - League Of Legends
+  - LOL
+  - videogame
+  - gamer
+  - tecnologia
+  - terapia
+  - barzinho
+  - bar
+  - cervejinha
+  - cerveja
+  - cruzeirense
+  - cruzeiro
+  - sertanejo
+  - violao
+  - engraçadinha
+  - pagode
+  - skate
+  - fitness
+  - esporte
+  - atividade física
+  - futebol
+  - estádio
+  - torcida
+  - domingo em família
+  - quero ter filhos
+  - quero filhos
+  negative_bio_keywords:
+  - ex
+  - tenho filhos
+  - drama
+  - nao uso
+  - filha
+  - filho
+  - criança
+  - mae
+  - mae solteira
+  - mãe solteira
+  - mãe
+  - F1
+  - não quero mais filhos
+  - nao quero mais filhos
+  - não quero filhos
+  bio_min_length: 20
+  disliked_names:
+  - Nega
+  - romântica anônima
+  - romântica
+  - anônima
+  desc_neg_suppressed:
+  - voce fuma?
+  - estilo de comunicacao
+  - familia
+swiper:
+  enabled: true
+  interactive_mode: false
+  auto_pause_on_focus_loss: false
+  pause_hotkey: f8
+  stop_hotkey: f10
+  reload_on_sync_failure: true
+  reload_on_swipe_failure: true
+  sync_max_wait_count: 20
+  sync_retry_sleep: 0.5
+  min_reload_interval_seconds: 90
+  max_consecutive_sync_skips: 3
+  max_pending_batches: 3
+  cpu_alert_threshold_percent: 80
+  mem_alert_threshold_percent: 85
+  mem_pressure_threshold_percent: 88
+  min_mem_available_mb: 1200
+  max_pending_queue: 20
+  drop_duplicate_profiles: true
+  recent_swipe_ttl_seconds: 600
+  recs_dedupe_ttl_seconds: 600
+  swipe_verify_timeout_seconds: 6.0
+  swipe_verify_max_attempts: 2
+  memory_resume:
+    enabled: true
+    check_interval_seconds: 10
+    reload_on_resume: false
+  native_fallback:
+    enabled: true
+    method: keyboard
+    wait_after_seconds: 0.8
+  card_center:
+  - 3103
+  - 550
+  view_time_range:
+  - 1.5
+  - 4.0
+  pause_between_swipes:
+  - 0.8
+  - 2.0
+  drag_distance_range:
+  - 280
+  - 420
+  browse_photos:
+    enabled: true
+    chance: 0.75
+    max_clicks: 6
+    next_probability: 0.8
+    click_x_offset: 130
+    click_y_offset_range:
+    - -170
+    - 60
+    delay_between_clicks:
+    - 0.7
+    - 1.8
+super_like:
+  enabled: true
+  probability_threshold: 0.8
+  text_score_min: 0.7
+  photo_score_min: 0.7
+  superlike_probability_min: 0.8
+  distance_range_km:
+  - 0
+  - 35
+  require_distance_known: true
+  require_tinder_available: true
+  require_balance_available: true
+  network_balance_required: false
+  availability_max_age_seconds: 8
+  balance_max_age_seconds: 900
+  drag_distance_range:
+  - 280
+  - 420
+hard_filters:
+  extra_fake_names: []
+  extra_fake_name_words: []
+  extra_male_names:
+  - Hugo
+  - Leo
+  - Leonardo
+  - Chrys
+  - Natan
+  - Katyyy
+  - Rychard
+  - Nycolas
+  - Theus
+  - Sapequinha
+  - MAmbrosio
+  - Nando
+  - Railander
+  - Ajudo sgl
+  - Filipe Gabriel
+  - Filipe
+  - Hsjwhhv
+  - Higor
+  - Ptk Poloski
+  - Davi
+  - Perereca
+  - isac
+  - Angel
+  - Cassio Eduardo
+  - Rian felipe
+  - Sub
+  - Casal
+  - Italo
+  - Hendrix
+  - Diego
+  - Rafael
+  - Fabio
+  - Descubra sigilo
+  - Caio Batista
+  - Andeson
+  photo_min_woman_confidence: 0.6
+  photo_min_brightness: 0.08
+photos:
+  enabled: true
+  save_liked: true
+  save_disliked: true
+  quality: full
+  analysis_quality: medium
+  detector_backend: opencv
+  detector_fallback_backend: mtcnn
+  enable_face_embedding: true
+  embedding_strategy: best_photo
+  embedding_detector_backend: opencv
+  embedding_timeout_seconds: 20
+  cache_no_face_results: false
+  max_per_folder: 2000
+  allow_legacy_audit_eviction: true
+  audit_retention_grace_hours: 168
+  max_analysis_photos: 3
+  training_initial_max_photos: 4
+  save_face_body_pair: true
+  face_save_min_confidence: 0.5
+  body_save_min_quality: 0.25
+  body_save_min_strength: 0.45
+  download_timeout_seconds: 8
+  analysis_timeout_seconds: 12
+  analysis_parallel_workers: 2
+  body_analysis:
+    enabled: true
+    mode: lightweight
+  semantic_analysis:
+    enabled: true
+    emotion: true
+    emotion_auto_download: false
+    body_width_min_quality: 0.35
+  semantic_embedding:
+    enabled: true
+    model_name: sentence-transformers/clip-ViT-B-32
+    high_quality_model_name: sentence-transformers/clip-ViT-L-14
+    quality_mode: balanced
+    device: auto
+    pca_components: 32
+    timeout_seconds: 20
+    batch_timeout_seconds: 60
+    batch_size: 8
+    max_photos_per_profile: 4
+    cache_path: data/photo_semantic_cache.json
+    cache_no_face_results: true
+  reanalyze_all_if_woman_confidence_below: 0.5
+  suspicious_gender_max_photos: 4
+  uncertain_max_photos: 4
+  uncertain_probability_threshold: 0.15
+browser:
+  enabled: false
+  profile_dir: data/chrome_profile
+  tinder_url: https://tinder.com/app/recs
+  channel: chrome
+  first_run_wait_for_login: true
+  pause_capture_when_unfocused: false
+  recs_dedupe_ttl_seconds: 600
+  enforce_recs_url:
+    enabled: true
+    canonical_url: https://tinder.com/app/recs
+    allowed_path_prefixes:
+    - /app/recs
+    wrong_url_cooldown_seconds: 20
+review_ui:
+  photo_deep_enabled: false
+notifications:
+  enabled: true
+  command: notify-send
+  app_name: Tinder IA
+  cooldown_seconds: 45
+  timeout_ms: 8000
+  events:
+    resource_high: true
+    memory_pressure: true
+    memory_pause: true
+    memory_resume: true
+    memory_stop: true
+    queue_cleared: true
+    queue_overflow: true
+    swipe_failure_reload: true
+    swipe_failure_skip: true
+    modal_dismissed: true
+    super_like_empty: true
+    super_like_modal: true
+    super_like_to_like: true
+    reload_start: true
+    reload_done: true
+    wrong_tinder_url: true
+    retrain_start: true
+    retrain_done: true
+    retrain_failed: true
+    likes_low: true
+    match: true
+scheduler:
+  enabled: false
+  windows:
+  - days:
+    - seg
+    - ter
+    - qua
+    - qui
+    - sex
+    - sab
+    - dom
+    start: '19:00'
+    end: 02:00
+model:
+  min_samples_for_rf: 30
+  min_photo_samples_for_model: 8
+  retrain_every: 10
+  photo_weight: 0.65
+  text_weight: 0.35
+  text_preference_weight: 0.4
+  distance_adjustment_weight: 0.08
+  gpu:
+    enabled: true
+    device_type: gpu
+    platform_id: 0
+    device_id: 0
+  gender_compatibility:
+    enabled: true
+    target: woman
+    min_woman_confidence: 0.2
+    min_certainty_for_filter: 0.65
+  decision_policy:
+    mode: recall_safe
+    fallback_like_threshold: 0.48
+    review_band:
+    - 0.4
+    - 0.6
+    threshold_optimizer: maximize_recall_with_precision_floor
+    precision_floor: 0.55
+    target_like_recall: 0.88
+  probability_safety:
+    enabled: true
+    max_confidence: 0.92
+    strong_agreement_confidence: 0.95
+    disagreement_confidence: 0.78
+    weak_evidence_confidence: 0.84
+  feedback_weights:
+    enabled: true
+    manual_correction_multiplier: 1.35
+    pass_correction_multiplier: 2.75
+    max_sample_weight: 8.0
+    active_learning_boost: 0.5
+    synthetic_weight: 0.35
+    photo_deep_weight: 1.6
+    photo_reason_multipliers:
+      photo_face: 1.25
+      photo_general: 1.0
+      photo_body: 1.15
+      photo_style: 0.75
+      photo_context: 0.55
+    intensity_multipliers:
+      '1': 0.85
+      '2': 1.0
+      '3': 1.35
+    photo_model:
+      photo: 2.6
+      bio: 0.25
+      interests: 0.25
+      descriptors: 0.35
+      other: 0.45
+      empty: 0.35
+    text_model:
+      photo: 0.25
+      bio: 2.4
+      interests: 2.4
+      descriptors: 2.0
+      other: 0.45
+      empty: 0.35
