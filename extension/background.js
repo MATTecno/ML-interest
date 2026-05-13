@@ -4,6 +4,13 @@
  */
 
 const SERVER_BASE = "http://localhost:5043";
+const CLOUD_DEFAULTS = {
+  cloudUrl: "http://127.0.0.1:8080",
+  deviceId: "local-pc",
+  token: "",
+  cloudEnabled: false,
+  autoswipeEnabled: false,
+};
 const NETWORK_CAPTURE_ENABLED = true;
 const NETWORK_CAPTURE_FLUSH_MS = 1000;
 const NETWORK_CAPTURE_MAX_QUEUE = 1000;
@@ -11,6 +18,8 @@ const EXTENSION_DEBUG_LOGS = false;
 let _networkCaptureQueue = [];
 let _networkCaptureTimer = null;
 const _webRequestStarted = new Map();
+let _cloudSessionId = "";
+let _cloudModeEnabledCache = false;
 
 function _debugLog(...args) {
   if (EXTENSION_DEBUG_LOGS) console.log(...args);
@@ -25,12 +34,12 @@ chrome.runtime.onMessage.addListener((message) => {
 
     case "TINDER_RECS":
       // Leva de perfis recebida → envia para classificação
-      _post("/profiles", message.payload);
+      _handleTinderRecs(message.payload);
       break;
 
     case "PROFILE_VISIBLE":
       // Perfil atualmente visível na tela → sincroniza com o swiper
-      _post("/current", {
+      _handleProfileVisible({
         name: message.name,
         tinder_id: message.tinder_id || "",
         age: message.age || 0,
@@ -40,7 +49,7 @@ chrome.runtime.onMessage.addListener((message) => {
       break;
 
     case "NETWORK_CAPTURE":
-      _enqueueNetworkCapture({
+      _handleNetworkCapture({
         source: "page_hook",
         ...message.payload,
       });
@@ -52,6 +61,182 @@ chrome.runtime.onMessage.addListener((message) => {
       break;
   }
 });
+
+function _cloudSession() {
+  if (!_cloudSessionId) {
+    _cloudSessionId =
+      "ext_" +
+      Date.now().toString(36) +
+      "_" +
+      Math.random().toString(36).slice(2, 10);
+  }
+  return _cloudSessionId;
+}
+
+function _settings() {
+  return chrome.storage.sync.get(CLOUD_DEFAULTS).then((saved) => ({
+    cloudUrl: String(saved.cloudUrl || CLOUD_DEFAULTS.cloudUrl).replace(/\/+$/, ""),
+    deviceId: String(saved.deviceId || CLOUD_DEFAULTS.deviceId),
+    token: String(saved.token || ""),
+    cloudEnabled: Boolean(saved.cloudEnabled),
+    autoswipeEnabled: Boolean(saved.autoswipeEnabled),
+  })).then((cfg) => {
+    _cloudModeEnabledCache = cfg.cloudEnabled;
+    return cfg;
+  });
+}
+
+chrome.storage.sync.get(CLOUD_DEFAULTS)
+  .then((saved) => {
+    _cloudModeEnabledCache = Boolean(saved.cloudEnabled);
+  })
+  .catch(() => {});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "sync" && changes.cloudEnabled) {
+    _cloudModeEnabledCache = Boolean(changes.cloudEnabled.newValue);
+  }
+});
+
+async function _handleTinderRecs(payload) {
+  const cfg = await _settings();
+  if (!cfg.cloudEnabled) {
+    _post("/profiles", payload);
+    return;
+  }
+  const profiles = _profilesForCloud(payload);
+  if (!profiles.length) return;
+  for (const profile of profiles) {
+    await _postCloud("/api/profiles", {
+      session_id: _cloudSession(),
+      device_id: cfg.deviceId,
+      autoswipe_enabled: cfg.autoswipeEnabled,
+      profile,
+    }, cfg);
+  }
+}
+
+async function _handleProfileVisible(visible) {
+  const cfg = await _settings();
+  if (!cfg.cloudEnabled) {
+    _post("/current", visible);
+    return;
+  }
+  await _postCloud("/api/commands", {
+    device_id: cfg.deviceId,
+    session_id: _cloudSession(),
+    command: "set_current",
+    visible_profile: visible,
+  }, cfg);
+}
+
+async function _handleNetworkCapture(event) {
+  const cfg = await _settings();
+  if (cfg.cloudEnabled) {
+    _debugLog("[cloud] Network capture bruto ignorado no modo cloud.");
+    return;
+  }
+  _enqueueNetworkCapture(event);
+}
+
+function _cloudHeaders(cfg) {
+  const headers = { "Content-Type": "application/json" };
+  if (cfg.token) headers.Authorization = `Bearer ${cfg.token}`;
+  return headers;
+}
+
+function _postCloud(path, body, cfg) {
+  return fetch(cfg.cloudUrl + path, {
+    method: "POST",
+    headers: _cloudHeaders(cfg),
+    body: JSON.stringify(body || {}),
+  })
+    .then((res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json().catch(() => ({}));
+    })
+    .catch((err) => {
+      _debugError(`[cloud] ${path} → erro`, err.message || err);
+    });
+}
+
+function _calcAge(birthDate) {
+  if (!birthDate) return 0;
+  try {
+    const birth = new Date(birthDate);
+    if (Number.isNaN(birth.getTime())) return 0;
+    const today = new Date();
+    let age = today.getFullYear() - birth.getFullYear();
+    const monthDelta = today.getMonth() - birth.getMonth();
+    if (monthDelta < 0 || (monthDelta === 0 && today.getDate() < birth.getDate())) age -= 1;
+    return age;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function _valueText(value) {
+  if (value === null || value === undefined || value === "") return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map(_valueText).filter(Boolean).join(", ");
+  if (typeof value === "object") {
+    if (Array.isArray(value.choice_selections)) {
+      const text = _valueText(value.choice_selections.map((item) => item?.name || item));
+      if (text) return text;
+    }
+    if (value.measurable_selection && value.measurable_selection.value !== undefined) {
+      return `${value.measurable_selection.value} ${value.measurable_selection.unit_of_measure || ""}`.trim();
+    }
+    for (const key of ["name", "value", "display_value", "display_text", "body_text", "subtitle", "description", "text", "title_text"]) {
+      const text = _valueText(value[key]);
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+function _extractDescriptors(user) {
+  const out = {};
+  for (const item of user?.selected_descriptors || []) {
+    const key = String(item?.name || item?.section_name || item?.prompt || item?.id || "").trim();
+    const value = _valueText(item);
+    if (key && value && key !== value) out[key] = value;
+  }
+  const intent = user?.relationship_intent || {};
+  if (intent?.body_text) {
+    out[String(intent.title_text || "Objetivo").trim() || "Objetivo"] = String(intent.body_text || "").trim();
+  }
+  return out;
+}
+
+function _profilesForCloud(payload) {
+  const results = payload?.data?.results || [];
+  const profiles = [];
+  for (const result of results) {
+    if (result?.type !== "user") continue;
+    const user = result.user || {};
+    const interests = (result.experiment_info?.user_interests?.selected_interests || [])
+      .map((item) => item?.name)
+      .filter(Boolean);
+    const distanceMi = result.distance_mi;
+    const distanceKm = distanceMi === null || distanceMi === undefined || distanceMi === ""
+      ? ""
+      : Math.round(Number(distanceMi) * 1.609);
+    profiles.push({
+      profile_id: user._id || result.content_hash || `${user.name || "perfil"}_${Date.now()}`,
+      tinder_id: user._id || "",
+      name: user.name || "",
+      age: _calcAge(user.birth_date || ""),
+      distance_km: Number.isFinite(distanceKm) ? distanceKm : "",
+      bio: user.bio || "",
+      interests,
+      descriptors: _extractDescriptors(user),
+      captured_at: new Date().toISOString(),
+    });
+  }
+  return profiles;
+}
 
 function _isLocalServerUrl(url) {
   return /^https?:\/\/(localhost|127\.0\.0\.1):5043\//i.test(String(url || ""));
@@ -110,6 +295,10 @@ function _requestBodySummary(requestBody) {
 
 function _enqueueNetworkCapture(event) {
   if (!NETWORK_CAPTURE_ENABLED || !event) return;
+  if (_cloudModeEnabledCache) {
+    _debugLog("[cloud] Network capture bruto ignorado no modo cloud.");
+    return;
+  }
   _networkCaptureQueue.push({
     extension_received_at: new Date().toISOString(),
     ...event,

@@ -2,6 +2,8 @@ const DEFAULTS = {
   cloudUrl: "http://127.0.0.1:8080",
   deviceId: "local-pc",
   token: "",
+  cloudEnabled: false,
+  autoswipeEnabled: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -19,6 +21,7 @@ async function loadSettings() {
   $("cloud-url").value = saved.cloudUrl || DEFAULTS.cloudUrl;
   $("device-id").value = saved.deviceId || DEFAULTS.deviceId;
   $("token").value = saved.token || "";
+  $("cloud-enabled").checked = Boolean(saved.cloudEnabled);
 }
 
 async function saveSettings() {
@@ -26,6 +29,7 @@ async function saveSettings() {
     cloudUrl: normalizeUrl($("cloud-url").value) || DEFAULTS.cloudUrl,
     deviceId: $("device-id").value.trim() || DEFAULTS.deviceId,
     token: $("token").value.trim(),
+    cloudEnabled: $("cloud-enabled").checked,
   };
   await chrome.storage.sync.set(data);
   setStatus("Configuração salva.");
@@ -38,6 +42,8 @@ async function settings() {
     cloudUrl: normalizeUrl(saved.cloudUrl || DEFAULTS.cloudUrl),
     deviceId: saved.deviceId || DEFAULTS.deviceId,
     token: saved.token || "",
+    cloudEnabled: Boolean(saved.cloudEnabled),
+    autoswipeEnabled: Boolean(saved.autoswipeEnabled),
   };
 }
 
@@ -71,6 +77,14 @@ async function sendCommand(command) {
   setStatus(`Comando enviado: ${data.command?.command || command}`);
 }
 
+async function setCloudState({ enabled, autoswipe }) {
+  const update = {};
+  if (typeof enabled === "boolean") update.cloudEnabled = enabled;
+  if (typeof autoswipe === "boolean") update.autoswipeEnabled = autoswipe;
+  await chrome.storage.sync.set(update);
+  if (typeof enabled === "boolean") $("cloud-enabled").checked = enabled;
+}
+
 async function openTinderInCurrentTab() {
   const url = "https://tinder.com/app/recs";
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -86,6 +100,7 @@ async function openTinderInCurrentTab() {
 document.addEventListener("DOMContentLoaded", async () => {
   await loadSettings();
   $("save").addEventListener("click", () => saveSettings().catch((err) => setStatus(err.message)));
+  $("cloud-enabled").addEventListener("change", () => saveSettings().catch((err) => setStatus(err.message)));
   $("health").addEventListener("click", async () => {
     try {
       const data = await cloudFetch("/health");
@@ -95,7 +110,29 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
   $("open").addEventListener("click", () => openTinderInCurrentTab().catch((err) => setStatus(`Erro: ${err.message}`)));
-  $("start").addEventListener("click", () => sendCommand("start_autoswipe").catch((err) => setStatus(`Erro: ${err.message}`)));
-  $("pause").addEventListener("click", () => sendCommand("pause_autoswipe").catch((err) => setStatus(`Erro: ${err.message}`)));
-  $("stop").addEventListener("click", () => sendCommand("stop_autoswipe").catch((err) => setStatus(`Erro: ${err.message}`)));
+  $("start").addEventListener("click", async () => {
+    try {
+      await saveSettings();
+      await setCloudState({ enabled: true, autoswipe: true });
+      await sendCommand("start_autoswipe");
+    } catch (err) {
+      setStatus(`Erro: ${err.message}`);
+    }
+  });
+  $("pause").addEventListener("click", async () => {
+    try {
+      await setCloudState({ autoswipe: false });
+      await sendCommand("pause_autoswipe");
+    } catch (err) {
+      setStatus(`Erro: ${err.message}`);
+    }
+  });
+  $("stop").addEventListener("click", async () => {
+    try {
+      await setCloudState({ autoswipe: false });
+      await sendCommand("stop_autoswipe");
+    } catch (err) {
+      setStatus(`Erro: ${err.message}`);
+    }
+  });
 });

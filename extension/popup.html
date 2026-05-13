@@ -26,6 +26,16 @@
       border-radius: 6px;
       font: inherit;
     }
+    .toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      font-weight: 600;
+    }
+    .toggle input {
+      width: auto;
+    }
     .grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -62,6 +72,11 @@
 
   <label for="token">Token</label>
   <input id="token" type="password" placeholder="Bearer token">
+
+  <label class="toggle">
+    <input id="cloud-enabled" type="checkbox">
+    Enviar perfis para cloud
+  </label>
 
   <div class="grid">
     <button id="save" class="primary">Salvar</button>
