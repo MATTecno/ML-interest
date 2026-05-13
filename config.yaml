@@ -272,6 +272,7 @@ photos:
   uncertain_probability_threshold: 0.15
 browser:
   enabled: false
+  prefer_existing_chrome: true
   profile_dir: data/chrome_profile
   tinder_url: https://tinder.com/app/recs
   channel: chrome

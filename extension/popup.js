@@ -71,6 +71,18 @@ async function sendCommand(command) {
   setStatus(`Comando enviado: ${data.command?.command || command}`);
 }
 
+async function openTinderInCurrentTab() {
+  const url = "https://tinder.com/app/recs";
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id) {
+    await chrome.tabs.update(tab.id, { url });
+    setStatus("Tinder aberto na aba atual.");
+    return;
+  }
+  await chrome.tabs.create({ url });
+  setStatus("Tinder aberto em nova aba.");
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   await loadSettings();
   $("save").addEventListener("click", () => saveSettings().catch((err) => setStatus(err.message)));
@@ -82,7 +94,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       setStatus(`Erro: ${err.message}`);
     }
   });
-  $("open").addEventListener("click", () => sendCommand("open_tinder").catch((err) => setStatus(`Erro: ${err.message}`)));
+  $("open").addEventListener("click", () => openTinderInCurrentTab().catch((err) => setStatus(`Erro: ${err.message}`)));
   $("start").addEventListener("click", () => sendCommand("start_autoswipe").catch((err) => setStatus(`Erro: ${err.message}`)));
   $("pause").addEventListener("click", () => sendCommand("pause_autoswipe").catch((err) => setStatus(`Erro: ${err.message}`)));
   $("stop").addEventListener("click", () => sendCommand("stop_autoswipe").catch((err) => setStatus(`Erro: ${err.message}`)));

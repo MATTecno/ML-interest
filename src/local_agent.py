@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -39,6 +41,10 @@ def _cloud_cfg() -> dict[str, Any]:
         "device_token": os.environ.get("TINDER_IA_DEVICE_TOKEN", cfg.get("device_token", "")),
         "poll_interval_seconds": float(os.environ.get("TINDER_IA_AGENT_POLL_SECONDS", cfg.get("poll_interval_seconds", 1.5)) or 1.5),
     }
+
+
+def _browser_cfg() -> dict[str, Any]:
+    return load_config().get("browser", {}) or {}
 
 
 class CloudClient:
@@ -76,6 +82,15 @@ class CloudClient:
 
 
 def _open_tinder() -> str:
+    """Abre o Tinder preferindo a sessao normal do Chrome ja logada."""
+    bcfg = _browser_cfg()
+    tinder_url = str(bcfg.get("tinder_url", "https://tinder.com/app/recs") or "https://tinder.com/app/recs")
+    prefer_existing = bool(bcfg.get("prefer_existing_chrome", True))
+    if prefer_existing:
+        opened = _open_in_existing_browser(tinder_url)
+        if opened:
+            return opened
+
     global _browser_thread
     if _browser_thread is not None and _browser_thread.is_alive():
         return "browser already running"
@@ -83,6 +98,44 @@ def _open_tinder() -> str:
 
     _browser_thread = launch_in_background()
     return "browser launch requested"
+
+
+def _run_detached(cmd: list[str]) -> bool:
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception:
+        logger.debug("Falha ao executar comando de browser: %s", cmd, exc_info=True)
+        return False
+
+
+def _open_in_existing_browser(url: str) -> str:
+    """
+    Tenta usar o navegador padrao/sessao normal do usuario.
+
+    Isso evita abrir o perfil isolado em `data/chrome_profile`, que pode nao
+    estar logado no Tinder. Se todos os comandos falharem, o agente cai no
+    fallback Playwright existente.
+    """
+    commands: list[list[str]] = []
+    xdg_open = shutil.which("xdg-open")
+    if xdg_open:
+        commands.append([xdg_open, url])
+
+    for browser in ("google-chrome", "google-chrome-stable", "chromium-browser", "chromium"):
+        path = shutil.which(browser)
+        if path:
+            commands.append([path, "--new-tab", url])
+
+    for cmd in commands:
+        if _run_detached(cmd):
+            return f"opened existing browser via {Path(cmd[0]).name}"
+    return ""
 
 
 def _execute_command(command: dict[str, Any]) -> str:
@@ -179,4 +232,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
