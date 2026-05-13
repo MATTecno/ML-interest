@@ -14,6 +14,9 @@ const CLOUD_DEFAULTS = {
 const NETWORK_CAPTURE_ENABLED = true;
 const NETWORK_CAPTURE_FLUSH_MS = 1000;
 const NETWORK_CAPTURE_MAX_QUEUE = 1000;
+const CLOUD_PHOTO_MAX_PER_PROFILE = 3;
+const CLOUD_PHOTO_MAX_BYTES = 2 * 1024 * 1024;
+const CLOUD_PHOTO_FETCH_TIMEOUT_MS = 8000;
 const EXTENSION_DEBUG_LOGS = false;
 let _networkCaptureQueue = [];
 let _networkCaptureTimer = null;
@@ -104,15 +107,18 @@ async function _handleTinderRecs(payload) {
     _post("/profiles", payload);
     return;
   }
-  const profiles = _profilesForCloud(payload);
-  if (!profiles.length) return;
-  for (const profile of profiles) {
-    await _postCloud("/api/profiles", {
+  const items = _profilesForCloud(payload);
+  if (!items.length) return;
+  for (const item of items) {
+    const photos = await _fetchPhotosForCloud(item.photoUrls);
+    const body = {
       session_id: _cloudSession(),
       device_id: cfg.deviceId,
       autoswipe_enabled: cfg.autoswipeEnabled,
-      profile,
-    }, cfg);
+      profile: item.profile,
+    };
+    if (photos.length) body.photos = photos;
+    await _postCloud("/api/profiles", body, cfg);
   }
 }
 
@@ -210,6 +216,89 @@ function _extractDescriptors(user) {
   return out;
 }
 
+function _photoArea(item) {
+  const width = Number(item?.width || item?.w || 0);
+  const height = Number(item?.height || item?.h || 0);
+  return width * height;
+}
+
+function _photoUrlsForCloud(result) {
+  const urls = [];
+  const seen = new Set();
+  const pushUrl = (url) => {
+    const clean = String(url || "").trim();
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    urls.push(clean);
+  };
+
+  for (const photo of result?.user?.photos || []) {
+    const processed = Array.isArray(photo?.processedFiles)
+      ? [...photo.processedFiles].sort((a, b) => _photoArea(b) - _photoArea(a))
+      : [];
+    for (const item of processed) pushUrl(item?.url);
+    pushUrl(photo?.url);
+    if (urls.length >= CLOUD_PHOTO_MAX_PER_PROFILE) break;
+  }
+  return urls.slice(0, CLOUD_PHOTO_MAX_PER_PROFILE);
+}
+
+function _arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function _fetchPhotoForCloud(url, index) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CLOUD_PHOTO_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      signal: controller.signal,
+      headers: { Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8" },
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const mime = String(response.headers.get("content-type") || "image/jpeg")
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
+    if (!mime.startsWith("image/")) throw new Error(`conteudo nao e imagem: ${mime}`);
+
+    const expectedBytes = Number(response.headers.get("content-length") || 0);
+    if (expectedBytes > CLOUD_PHOTO_MAX_BYTES) {
+      throw new Error(`foto acima do limite: ${expectedBytes} bytes`);
+    }
+
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength > CLOUD_PHOTO_MAX_BYTES) {
+      throw new Error(`foto acima do limite: ${buffer.byteLength} bytes`);
+    }
+
+    return {
+      index,
+      mime,
+      content_base64: _arrayBufferToBase64(buffer),
+    };
+  } catch (err) {
+    _debugError("[cloud] Foto ignorada no upload:", err?.message || err);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function _fetchPhotosForCloud(urls) {
+  const limited = (urls || []).slice(0, CLOUD_PHOTO_MAX_PER_PROFILE);
+  const photos = await Promise.all(limited.map((url, index) => _fetchPhotoForCloud(url, index)));
+  return photos.filter(Boolean);
+}
+
 function _profilesForCloud(payload) {
   const results = payload?.data?.results || [];
   const profiles = [];
@@ -224,15 +313,18 @@ function _profilesForCloud(payload) {
       ? ""
       : Math.round(Number(distanceMi) * 1.609);
     profiles.push({
-      profile_id: user._id || result.content_hash || `${user.name || "perfil"}_${Date.now()}`,
-      tinder_id: user._id || "",
-      name: user.name || "",
-      age: _calcAge(user.birth_date || ""),
-      distance_km: Number.isFinite(distanceKm) ? distanceKm : "",
-      bio: user.bio || "",
-      interests,
-      descriptors: _extractDescriptors(user),
-      captured_at: new Date().toISOString(),
+      profile: {
+        profile_id: user._id || result.content_hash || `${user.name || "perfil"}_${Date.now()}`,
+        tinder_id: user._id || "",
+        name: user.name || "",
+        age: _calcAge(user.birth_date || ""),
+        distance_km: Number.isFinite(distanceKm) ? distanceKm : "",
+        bio: user.bio || "",
+        interests,
+        descriptors: _extractDescriptors(user),
+        captured_at: new Date().toISOString(),
+      },
+      photoUrls: _photoUrlsForCloud(result),
     });
   }
   return profiles;
