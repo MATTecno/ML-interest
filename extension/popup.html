@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tinder IA</title>
+  <style>
+    body {
+      width: 300px;
+      margin: 0;
+      padding: 12px;
+      font: 13px system-ui, sans-serif;
+      color: #17202a;
+      background: #ffffff;
+    }
+    label {
+      display: block;
+      margin: 8px 0 4px;
+      font-weight: 600;
+    }
+    input {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 7px;
+      border: 1px solid #cfd7df;
+      border-radius: 6px;
+      font: inherit;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    button {
+      padding: 8px;
+      border: 1px solid #bcc7d1;
+      border-radius: 6px;
+      background: #f7f9fb;
+      cursor: pointer;
+      font: inherit;
+    }
+    button.primary {
+      background: #17202a;
+      color: #fff;
+      border-color: #17202a;
+    }
+    #status {
+      min-height: 18px;
+      margin-top: 10px;
+      color: #46515c;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <label for="cloud-url">Cloud API</label>
+  <input id="cloud-url" placeholder="https://sua-api.example.com">
+
+  <label for="device-id">Device</label>
+  <input id="device-id" placeholder="local-pc">
+
+  <label for="token">Token</label>
+  <input id="token" type="password" placeholder="Bearer token">
+
+  <div class="grid">
+    <button id="save" class="primary">Salvar</button>
+    <button id="health">Health</button>
+    <button id="open">Abrir Tinder</button>
+    <button id="start">Iniciar</button>
+    <button id="pause">Pausar</button>
+    <button id="stop">Parar</button>
+  </div>
+
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

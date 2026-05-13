@@ -3,7 +3,7 @@
   "name": "Tinder-IA Connector",
   "version": "1.0",
   "description": "Captura perfis do Tinder e envia para o classificador local",
-  "permissions": ["activeTab", "webRequest"],
+  "permissions": ["activeTab", "webRequest", "storage"],
   "host_permissions": [
     "<all_urls>",
     "http://localhost/*"
@@ -17,6 +17,10 @@
   ],
   "background": {
     "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Tinder IA",
+    "default_popup": "popup.html"
   },
   "web_accessible_resources": [
     {

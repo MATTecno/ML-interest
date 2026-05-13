@@ -327,6 +327,14 @@ scheduler:
     - dom
     start: '19:00'
     end: 02:00
+cloud:
+  enabled: false
+  api_url: http://127.0.0.1:8080
+  device_id: local-pc
+  device_token: ''
+  poll_interval_seconds: 1.5
+  upload_photos_from_extension: true
+  autoswipe_default: false
 model:
   min_samples_for_rf: 30
   min_photo_samples_for_model: 8

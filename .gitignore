@@ -10,6 +10,7 @@ __pycache__/
 .env
 .env.*
 *.env
+!.env.example
 .venv/
 venv/
 env/
@@ -19,6 +20,7 @@ env/
 .codex
 .agents/
 .claude/settings.local.json
+docs/
 
 # OS/editor noise
 .DS_Store
@@ -32,6 +34,7 @@ data/logs/
 data/debug/
 data/alerts/
 data/reports/
+data/cloud_runtime/
 
 # Browser/session state
 data/chrome_profile/
