@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import mimetypes
 import os
 import sys
 import threading
@@ -18,7 +19,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -111,6 +112,7 @@ class CloudStore:
         self.profiles_path = root / "profiles.jsonl"
         self.commands_path = root / "commands.jsonl"
         self.acks_path = root / "command_acks.json"
+        self.reviews_path = root / "review_actions.jsonl"
         self._lock = threading.Lock()
         self.root.mkdir(parents=True, exist_ok=True)
         PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
@@ -165,6 +167,19 @@ class CloudStore:
             }
             _write_json(self.acks_path, acks)
             return acks[command_id]
+
+    def save_review_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        record = {
+            "action_id": new_id("rev"),
+            "reviewed_at": utc_now_iso(),
+            **action,
+        }
+        with self._lock:
+            _append_jsonl(self.reviews_path, record)
+        return record
+
+    def list_review_actions(self, limit: int = 100) -> list[dict[str, Any]]:
+        return _load_jsonl(self.reviews_path, limit=limit)
 
 
 STORE = CloudStore()
@@ -272,6 +287,48 @@ def _command_for_decision(device_id: str, session_id: str, profile: dict[str, An
     })
 
 
+def _safe_cloud_photo_path(rel_path: str) -> Path | None:
+    raw = str(rel_path or "").strip()
+    if not raw or raw.startswith("/"):
+        return None
+    try:
+        root = PHOTOS_DIR.resolve()
+        candidate = (ROOT_DIR / raw).resolve()
+    except Exception:
+        return None
+    if candidate == root or root not in candidate.parents:
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+def _auth_query_from_path(path: str) -> str:
+    parsed = urlparse(path)
+    token = parse_qs(parsed.query).get("token", [""])[0]
+    if token:
+        return "?token=" + quote(token)
+    return ""
+
+
+def _clean_review_action(payload: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"like", "dislike", "skip"}
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in allowed:
+        raise ValueError(f"acao de review invalida: {action}")
+    note = str(payload.get("note") or "").replace("\x00", "").strip()
+    if len(note) > 500:
+        note = note[:500]
+    return {
+        "record_id": str(payload.get("record_id") or "").strip()[:160],
+        "profile_id": str(payload.get("profile_id") or "").strip()[:160],
+        "session_id": str(payload.get("session_id") or "").strip()[:160],
+        "device_id": str(payload.get("device_id") or "").strip()[:160],
+        "action": action,
+        "note": note,
+    }
+
+
 class CloudHandler(BaseHTTPRequestHandler):
     server_version = "TinderIACloud/0.1"
 
@@ -293,6 +350,16 @@ class CloudHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_file(self, path: Path) -> None:
+        mime, _ = mimetypes.guess_type(path.name)
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mime or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "private, max-age=3600")
         self.end_headers()
         self.wfile.write(body)
 
@@ -339,10 +406,30 @@ class CloudHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send_html(self._render_home())
             return
+        if path == "/review":
+            if not self._require_auth():
+                return
+            self._send_html(self._render_review())
+            return
+        if path == "/photo":
+            if not self._require_auth():
+                return
+            rel_path = parse_qs(parsed.query).get("path", [""])[0]
+            photo_path = _safe_cloud_photo_path(rel_path)
+            if photo_path is None:
+                self._send_json({"ok": False, "error": "photo_not_found"}, status=404)
+                return
+            self._send_file(photo_path)
+            return
         if path == "/api/profiles":
             if not self._require_auth():
                 return
             self._send_json({"ok": True, "profiles": STORE.list_profiles(limit=100)})
+            return
+        if path == "/api/reviews":
+            if not self._require_auth():
+                return
+            self._send_json({"ok": True, "reviews": STORE.list_review_actions(limit=100)})
             return
         if path.startswith("/api/devices/") and path.endswith("/commands"):
             if not self._require_auth(device=True):
@@ -384,6 +471,18 @@ class CloudHandler(BaseHTTPRequestHandler):
                 return
             STORE.enqueue_command(command)
             self._send_json({"ok": True, "command": command})
+            return
+
+        if path == "/api/reviews":
+            if not self._require_auth():
+                return
+            try:
+                action = _clean_review_action(payload)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            saved = STORE.save_review_action(action)
+            self._send_json({"ok": True, "review": saved})
             return
 
         if path.startswith("/api/commands/") and path.endswith("/ack"):
@@ -459,6 +558,7 @@ class CloudHandler(BaseHTTPRequestHandler):
   <title>Tinder IA Cloud</title>
   <style>
     body {{ font-family: system-ui, sans-serif; margin: 24px; color: #17202a; }}
+    a {{ color: #17202a; }}
     table {{ border-collapse: collapse; width: 100%; margin-top: 16px; }}
     th, td {{ border-bottom: 1px solid #ddd; padding: 8px; text-align: left; }}
     code {{ background: #f4f4f4; padding: 2px 4px; border-radius: 4px; }}
@@ -466,11 +566,139 @@ class CloudHandler(BaseHTTPRequestHandler):
 </head>
 <body>
   <h1>Tinder IA Cloud</h1>
-  <p>API ativa. Health: <code>/health</code>. Perfis recentes: <code>/api/profiles</code>.</p>
+  <p>API ativa. Health: <code>/health</code>. Perfis recentes: <code>/api/profiles</code>. Painel: <a href="/review">/review</a>.</p>
   <table>
     <thead><tr><th>Quando</th><th>Nome</th><th>Idade</th><th>Decisao</th><th>Prob.</th></tr></thead>
     <tbody>{''.join(rows) or '<tr><td colspan="5">Nenhum perfil recebido ainda.</td></tr>'}</tbody>
   </table>
+</body>
+</html>"""
+
+    def _render_review(self) -> str:
+        auth_query = _auth_query_from_path(self.path)
+        profiles = list(reversed(STORE.list_profiles(limit=60)))
+        reviewed = {
+            str(item.get("record_id") or ""): str(item.get("action") or "")
+            for item in STORE.list_review_actions(limit=500)
+        }
+        cards = []
+        for item in profiles:
+            profile = item.get("profile") or {}
+            result = item.get("result") or {}
+            photos = [
+                p for p in item.get("photos_saved") or []
+                if _safe_cloud_photo_path(str(p)) is not None
+            ]
+            record_id = str(item.get("record_id") or "")
+            profile_id = str(profile.get("profile_id") or "")
+            review_action = reviewed.get(record_id, "")
+            photo_html = "".join(
+                f'<img src="/photo?path={quote(str(path))}{("&" + auth_query[1:]) if auth_query else ""}" loading="lazy" alt="">'
+                for path in photos[:4]
+            ) or '<div class="no-photo">sem foto salva</div>'
+            probability = result.get("probability", "")
+            try:
+                probability = f"{float(probability) * 100:.0f}%"
+            except Exception:
+                probability = str(probability)
+            descriptors = profile.get("_descriptors") or {}
+            descriptor_html = "".join(
+                f"<span>{html.escape(str(k))}: {html.escape(str(v))}</span>"
+                for k, v in list(descriptors.items())[:8]
+            )
+            cards.append(f"""
+      <article class="card" data-record-id="{html.escape(record_id)}">
+        <div class="photos">{photo_html}</div>
+        <div class="content">
+          <div class="topline">
+            <h2>{html.escape(str(profile.get('name', '')))} <small>{html.escape(str(profile.get('age', '')))}</small></h2>
+            <span class="decision">{html.escape(str(result.get('decision', '')))} {html.escape(str(probability))}</span>
+          </div>
+          <p>{html.escape(str(profile.get('bio', '')))}</p>
+          <div class="chips">{''.join(f'<span>{html.escape(str(x))}</span>' for x in profile.get('interests', [])[:12])}</div>
+          <div class="chips muted">{descriptor_html}</div>
+          <div class="meta">
+            <span>{html.escape(str(item.get('created_at', '')))}</span>
+            <span>{html.escape(str(result.get('model_type', '')))}</span>
+            <span class="review-state">{'revisado: ' + html.escape(review_action) if review_action else 'pendente'}</span>
+          </div>
+          <div class="actions">
+            <button data-action="like" data-record="{html.escape(record_id)}" data-profile="{html.escape(profile_id)}">Curtir</button>
+            <button data-action="dislike" data-record="{html.escape(record_id)}" data-profile="{html.escape(profile_id)}">Nao curtir</button>
+            <button data-action="skip" data-record="{html.escape(record_id)}" data-profile="{html.escape(profile_id)}">Pular</button>
+          </div>
+        </div>
+      </article>""")
+
+        return f"""<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tinder IA Review</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; font-family: system-ui, sans-serif; color: #17202a; background: #f5f7f9; }}
+    header {{ position: sticky; top: 0; z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 20px; border-bottom: 1px solid #dde3ea; background: rgba(255,255,255,.96); }}
+    h1 {{ margin: 0; font-size: 20px; }}
+    main {{ max-width: 1180px; margin: 0 auto; padding: 18px; display: grid; gap: 14px; }}
+    .card {{ display: grid; grid-template-columns: minmax(220px, 340px) 1fr; gap: 16px; padding: 12px; border: 1px solid #dde3ea; border-radius: 8px; background: #fff; }}
+    .photos {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; align-content: start; }}
+    .photos img, .no-photo {{ width: 100%; aspect-ratio: 3 / 4; object-fit: cover; border-radius: 6px; background: #edf1f5; }}
+    .no-photo {{ display: grid; place-items: center; color: #67717c; }}
+    .topline {{ display: flex; justify-content: space-between; gap: 12px; align-items: start; }}
+    h2 {{ margin: 0; font-size: 22px; }}
+    h2 small {{ font-weight: 500; color: #5f6b76; }}
+    p {{ margin: 10px 0; line-height: 1.45; white-space: pre-wrap; }}
+    .decision {{ padding: 4px 8px; border-radius: 999px; background: #eef3f7; white-space: nowrap; font-weight: 700; }}
+    .chips {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }}
+    .chips span {{ padding: 4px 7px; border-radius: 999px; background: #edf7f0; color: #23412e; font-size: 12px; }}
+    .chips.muted span {{ background: #f1f3f5; color: #55616d; }}
+    .meta {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; color: #687480; font-size: 12px; }}
+    .actions {{ display: flex; gap: 8px; margin-top: 12px; }}
+    button {{ border: 1px solid #c4ccd5; border-radius: 6px; background: #fff; padding: 8px 10px; cursor: pointer; font: inherit; }}
+    button:hover {{ background: #f1f4f7; }}
+    @media (max-width: 760px) {{
+      .card {{ grid-template-columns: 1fr; }}
+      header {{ align-items: start; flex-direction: column; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Tinder IA Review</h1>
+    <span>{len(profiles)} perfis recentes</span>
+  </header>
+  <main>{''.join(cards) or '<p>Nenhum perfil recebido ainda.</p>'}</main>
+  <script>
+    const authQuery = {json.dumps(auth_query)};
+    document.addEventListener("click", async (event) => {{
+      const button = event.target.closest("button[data-action]");
+      if (!button) return;
+      const card = button.closest(".card");
+      const payload = {{
+        action: button.dataset.action,
+        record_id: button.dataset.record,
+        profile_id: button.dataset.profile,
+      }};
+      button.disabled = true;
+      try {{
+        const res = await fetch("/api/reviews" + authQuery, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(payload),
+        }});
+        const data = await res.json();
+        if (!res.ok || data.ok === false) throw new Error(data.error || "erro");
+        const state = card.querySelector(".review-state");
+        if (state) state.textContent = "revisado: " + payload.action;
+      }} catch (err) {{
+        alert("Falha ao salvar review: " + (err.message || err));
+      }} finally {{
+        button.disabled = false;
+      }}
+    }});
+  </script>
 </body>
 </html>"""
 
@@ -488,4 +716,3 @@ def run(host: str = "0.0.0.0", port: int = DEFAULT_PORT) -> None:
 
 if __name__ == "__main__":
     run()
-
