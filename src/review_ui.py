@@ -129,6 +129,10 @@ def _domains_from_feedback_details(details: dict) -> list[str]:
         or details.get("photo_negative_details")
         or details.get("body_frame_correction")
         or details.get("body_build_correction")
+        or details.get("visual_face_label")
+        or details.get("visual_body_label")
+        or details.get("visual_style_label")
+        or details.get("visual_overall_label")
     ):
         add("photo")
     if details.get("descriptor_detail") or details.get("descriptor_positive_details") or details.get("descriptor_negative_details"):
@@ -140,6 +144,21 @@ def _domains_from_feedback_details(details: dict) -> list[str]:
     if details.get("bio_detail") or details.get("bio_not_positive") or details.get("bio_not_negative"):
         add("bio")
     return domains
+
+
+def _clean_visual_label(value: str) -> str:
+    clean = str(value or "").strip().lower()
+    return clean if clean in {"positive", "neutral", "negative"} else ""
+
+
+def _visual_label_select() -> str:
+    options = [
+        ("", "sem marcar"),
+        ("positive", "gostei"),
+        ("neutral", "neutro"),
+        ("negative", "não gostei"),
+    ]
+    return "\n".join(f'<option value="{value}">{_esc(label)}</option>' for value, label in options)
 
 
 def _primary_domain_from_details(details: dict, fallback: str = "other") -> str:
@@ -2159,6 +2178,7 @@ def _render_card(row: dict, prefs: dict) -> str:
 
     photo_positive_choices = _photo_fine_choices("photo_positive_detail", "positive", True)
     photo_negative_choices = _photo_fine_choices("photo_negative_detail", "negative", False)
+    visual_label_options = _visual_label_select()
 
     metrics = (
         f'<span>mulher <b>{_pct(row, "photo_woman_confidence")}</b></span>'
@@ -2209,6 +2229,23 @@ def _render_card(row: dict, prefs: dict) -> str:
             {signal_corrections_html}
 
             <div class="fields">
+              <div class="detail-slot visual-label-wrap">
+                <span class="field-title">Avaliação visual separada</span>
+                <div class="visual-label-grid">
+                  <label>Rosto
+                    <select name="visual_face_label">{visual_label_options}</select>
+                  </label>
+                  <label>Corpo
+                    <select name="visual_body_label">{visual_label_options}</select>
+                  </label>
+                  <label>Estilo / qualidade
+                    <select name="visual_style_label">{visual_label_options}</select>
+                  </label>
+                  <label>Foto geral
+                    <select name="visual_overall_label">{visual_label_options}</select>
+                  </label>
+                </div>
+              </div>
               <div class="reason-picker">
                 <input type="hidden" name="feedback_domain" class="primary-domain-input" value="">
                 <span class="field-title">O que pesou <small>marque um ou mais</small></span>
@@ -3230,6 +3267,12 @@ _CSS = """
       padding: 10px;
       background: #f8faf7;
     }
+    .visual-label-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(130px, 1fr));
+      gap: 8px;
+    }
+    .visual-label-grid label { min-width: 0; }
     .photo-detail-wrap { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(180px, 240px) repeat(2, minmax(180px, 1fr)); gap: 10px; }
     .photo-detail-wrap > label { grid-column: auto; }
     .interests-detail-wrap, .bio-detail-wrap, .desc-detail-wrap, .other-detail-wrap { grid-column: 1 / -1; }
@@ -3671,6 +3714,7 @@ _CSS = """
       .card { grid-template-columns: 1fr; }
       .photo { height: clamp(320px, 70vh, 620px); }
       .fields { grid-template-columns: 1fr; }
+      .visual-label-grid { grid-template-columns: 1fr 1fr; }
       .photo-detail-wrap { grid-column: 1 / -1; grid-template-columns: 1fr; }
       .decision-summary { grid-template-columns: 1fr; }
       .signal-grid { grid-template-columns: 1fr; }
@@ -5833,6 +5877,20 @@ class ReviewHandler(BaseHTTPRequestHandler):
             photo_score_intensity = self._form_one(form, "photo_score_intensity")
             if photo_score_intensity not in {"1", "2", "3"}:
                 photo_score_intensity = intensity if intensity in {"1", "2", "3"} else "2"
+            visual_face_label = _clean_visual_label(self._form_one(form, "visual_face_label"))
+            visual_body_label = _clean_visual_label(self._form_one(form, "visual_body_label"))
+            visual_style_label = _clean_visual_label(self._form_one(form, "visual_style_label"))
+            visual_overall_label = _clean_visual_label(self._form_one(form, "visual_overall_label"))
+            visual_label_summary = [
+                f"{label}={value}"
+                for label, value in (
+                    ("rosto", visual_face_label),
+                    ("corpo", visual_body_label),
+                    ("estilo", visual_style_label),
+                    ("geral", visual_overall_label),
+                )
+                if value
+            ]
             signal_veto_details = self._signal_veto_details(form)
             body_frame_correction = ""
             body_build_correction = ""
@@ -5868,6 +5926,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 feedback_reason = (
                     feedback_reason or primary_domain or "ajuste de foto"
                 ) + f"; score_foto_{direction}: {photo_score_reason}"
+            if visual_label_summary:
+                feedback_reason = (
+                    feedback_reason or primary_domain or "avaliação visual"
+                ) + "; visual: " + ", ".join(visual_label_summary)
             veto_summary = self._signal_veto_summary(signal_veto_details)
             if veto_summary:
                 feedback_reason = (feedback_reason or primary_domain or "correção de sinais") + "; " + veto_summary
@@ -5883,6 +5945,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "photo_score_intensity": photo_score_intensity if photo_score_adjustment else "",
                 "photo_positive_details": photo_positive_details,
                 "photo_negative_details": photo_negative_details,
+                "visual_face_label": visual_face_label,
+                "visual_body_label": visual_body_label,
+                "visual_style_label": visual_style_label,
+                "visual_overall_label": visual_overall_label,
                 "selected_interests": selected_interests,
                 "bio_detail": bio_detail,
                 "descriptor_detail": descriptor_detail,
@@ -6018,6 +6084,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             photo_score_intensity = self._form_one(form, "photo_score_intensity")
             if photo_score_intensity not in {"1", "2", "3"}:
                 photo_score_intensity = "2"
+            visual_face_label = _clean_visual_label(self._form_one(form, "visual_face_label"))
+            visual_body_label = _clean_visual_label(self._form_one(form, "visual_body_label"))
+            visual_style_label = _clean_visual_label(self._form_one(form, "visual_style_label"))
+            visual_overall_label = _clean_visual_label(self._form_one(form, "visual_overall_label"))
             reviews = load_reviews(None)
             original_decision = "NÃO CURTIR"
             for r in reviews:
@@ -6031,6 +6101,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "photo_score_adjustment": photo_score_adjustment,
                 "photo_score_reason": photo_score_reason if photo_score_adjustment else "",
                 "photo_score_intensity": photo_score_intensity if photo_score_adjustment else "",
+                "visual_face_label": visual_face_label,
+                "visual_body_label": visual_body_label,
+                "visual_style_label": visual_style_label,
+                "visual_overall_label": visual_overall_label,
                 "body_frame_correction": body_frame_correction,
                 "body_build_correction": body_build_correction,
             }
@@ -6053,6 +6127,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if photo_score_adjustment:
                 direction = "subir" if photo_score_adjustment == "higher" else "baixar"
                 feedback_reason += f"; score_foto_{direction}: {photo_score_reason}"
+            visual_label_summary = [
+                f"{label}={value}"
+                for label, value in (
+                    ("rosto", visual_face_label),
+                    ("corpo", visual_body_label),
+                    ("estilo", visual_style_label),
+                    ("geral", visual_overall_label),
+                )
+                if value
+            ]
+            if visual_label_summary:
+                feedback_reason += "; visual: " + ", ".join(visual_label_summary)
             veto_summary = self._signal_veto_summary(signal_veto_details)
             if veto_summary:
                 feedback_reason += "; " + veto_summary

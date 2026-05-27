@@ -43,6 +43,10 @@ CSV_FIELDNAMES = [
     "feedback_intensity",
     "feedback_sentiment",
     "feedback_secondary",
+    "visual_face_label",
+    "visual_body_label",
+    "visual_style_label",
+    "visual_overall_label",
     "feedback_details",
     "swipe_probability",
     "preference_tier",
@@ -52,6 +56,14 @@ CSV_FIELDNAMES = [
     "label",
     "source",
 ]
+
+VISUAL_LABEL_FIELDS = (
+    "visual_face_label",
+    "visual_body_label",
+    "visual_style_label",
+    "visual_overall_label",
+)
+VISUAL_LABEL_VALUES = {"positive", "neutral", "negative"}
 
 
 def _empty_df() -> pd.DataFrame:
@@ -115,6 +127,7 @@ def _profile_to_csv_row(profile: dict, label: int | str | None) -> dict:
     label_value = "" if label in ("", None, "maybe") else int(float(label))
     final_decision = profile.get("final_decision", "")
     photo_identity = photo_identity_values_from_profile(profile)
+    visual_labels = _visual_labels_from_profile(profile)
     row = {
         "name": profile.get("name", ""),
         "age": profile.get("age", ""),
@@ -138,6 +151,7 @@ def _profile_to_csv_row(profile: dict, label: int | str | None) -> dict:
         "feedback_intensity": profile.get("feedback_intensity", ""),
         "feedback_sentiment": profile.get("feedback_sentiment", ""),
         "feedback_secondary": profile.get("feedback_secondary", ""),
+        **visual_labels,
         "feedback_details": profile.get("feedback_details", ""),
         "swipe_probability": profile.get("swipe_probability", ""),
         "preference_tier": profile.get("preference_tier", ""),
@@ -187,6 +201,28 @@ def _profile_to_csv_row(profile: dict, label: int | str | None) -> dict:
             row[feat_name] = ""
 
     return row
+
+
+def _visual_labels_from_profile(profile: dict) -> dict[str, str]:
+    labels = {}
+    for field in VISUAL_LABEL_FIELDS:
+        value = str(profile.get(field, "") or "").strip().lower()
+        labels[field] = value if value in VISUAL_LABEL_VALUES else ""
+
+    details_raw = profile.get("feedback_details", "")
+    try:
+        details = json.loads(details_raw or "{}")
+    except Exception:
+        details = {}
+    if not isinstance(details, dict):
+        return labels
+
+    for field in VISUAL_LABEL_FIELDS:
+        if labels[field]:
+            continue
+        value = str(details.get(field, "") or "").strip().lower()
+        labels[field] = value if value in VISUAL_LABEL_VALUES else ""
+    return labels
 
 
 def _write_profile_rows(rows: list[dict]) -> None:

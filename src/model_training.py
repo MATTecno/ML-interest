@@ -463,6 +463,49 @@ _PHOTO_FINE_REASON_BY_DETAIL = {
     "photo_quality": "photo_style",
 }
 
+_VISUAL_LABEL_FIELDS = {
+    "visual_face_label": "photo_face",
+    "visual_body_label": "photo_body",
+    "visual_style_label": "photo_style",
+    "visual_overall_label": "photo_general",
+}
+_VISUAL_LABEL_TARGET = {"positive": 1, "negative": 0}
+
+
+def _visual_label(row: pd.Series, field: str, details: dict | None = None) -> str:
+    details = details if details is not None else _parse_feedback_details(row)
+    value = str(details.get(field) or row.get(field, "") or "").strip().lower()
+    return value if value in {"positive", "neutral", "negative"} else ""
+
+
+def _visual_target_label(row: pd.Series, details: dict | None = None) -> int | None:
+    details = details if details is not None else _parse_feedback_details(row)
+    overall = _visual_label(row, "visual_overall_label", details)
+    if overall in _VISUAL_LABEL_TARGET:
+        return _VISUAL_LABEL_TARGET[overall]
+
+    positive = 0
+    negative = 0
+    for field in ("visual_face_label", "visual_body_label", "visual_style_label"):
+        value = _visual_label(row, field, details)
+        if value == "positive":
+            positive += 1
+        elif value == "negative":
+            negative += 1
+
+    positive += len(_detail_list(details.get("photo_positive_details")))
+    negative += len(_detail_list(details.get("photo_negative_details")))
+    if positive > 0 and negative == 0:
+        return 1
+    if negative > 0 and positive == 0:
+        return 0
+    return None
+
+
+def _has_directional_visual_label(row: pd.Series, details: dict | None = None) -> bool:
+    details = details if details is not None else _parse_feedback_details(row)
+    return any(_visual_label(row, field, details) in _VISUAL_LABEL_TARGET for field in _VISUAL_LABEL_FIELDS)
+
 
 def _detail_list(value) -> list[str]:
     if value in ("", None):
@@ -502,6 +545,13 @@ def _feedback_domains(row: pd.Series, details: dict | None = None) -> set[str]:
         add(item)
     for item in _detail_list(row.get("feedback_secondary", "")):
         add(item)
+    if (
+        details.get("photo_score_adjustment")
+        or details.get("photo_positive_details")
+        or details.get("photo_negative_details")
+        or _has_directional_visual_label(row, details)
+    ):
+        add("photo")
     return domains
 
 
@@ -528,17 +578,21 @@ def _photo_detail_reason(row: pd.Series, target_label: int) -> str:
     modelo visual que aquele rosto era ruim.
     """
     details = _parse_feedback_details(row)
+    counts: dict[str, int] = {}
+    wanted = "positive" if int(target_label) == 1 else "negative"
+    for field, reason in _VISUAL_LABEL_FIELDS.items():
+        if _visual_label(row, field, details) == wanted:
+            counts[reason] = counts.get(reason, 0) + 1
+
     source_key = "photo_positive_details" if int(target_label) == 1 else "photo_negative_details"
     selected = _detail_list(details.get(source_key))
     if not selected:
-        return ""
+        selected = []
 
-    counts: dict[str, int] = {}
     for item in selected:
         reason = _PHOTO_FINE_REASON_BY_DETAIL.get(str(item).strip())
-        if not reason:
-            continue
-        counts[reason] = counts.get(reason, 0) + 1
+        if reason:
+            counts[reason] = counts.get(reason, 0) + 1
     if not counts:
         return ""
 
@@ -558,6 +612,9 @@ def _photo_target_label(row: pd.Series, photo_adjustment: str = "") -> int:
         return 1
     if photo_adjustment == "lower":
         return 0
+    visual_label = _visual_target_label(row)
+    if visual_label is not None:
+        return int(visual_label)
     try:
         return int(float(row.get("label", 0) or 0))
     except Exception:
@@ -572,10 +629,7 @@ def _training_labels(df: pd.DataFrame, domain: str) -> np.ndarray:
     adjusted = labels.copy()
     for idx, (_, row) in enumerate(df.iterrows()):
         adjustment = _photo_score_adjustment(row)
-        if adjustment == "higher":
-            adjusted[idx] = 1
-        elif adjustment == "lower":
-            adjusted[idx] = 0
+        adjusted[idx] = _photo_target_label(row, adjustment)
     return adjusted
 
 

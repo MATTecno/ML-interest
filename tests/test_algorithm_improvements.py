@@ -178,6 +178,8 @@ class AlgorithmImprovementTests(unittest.TestCase):
 
                 self.assertIn("preference_tier", rows[0])
                 self.assertIn("correction_type", rows[0])
+                self.assertIn("visual_face_label", rows[0])
+                self.assertIn("visual_overall_label", rows[0])
                 self.assertIn("photo_clip_pc_01", rows[0])
                 self.assertIn("photo_semantic_embedding_saved", rows[0])
                 self.assertEqual(dataset.count_real_profiles(), 3)
@@ -186,6 +188,33 @@ class AlgorithmImprovementTests(unittest.TestCase):
             finally:
                 dataset.PROFILES_PATH = old_profiles_path
                 dataset.SYNTHETIC_PATH = old_synthetic_path
+
+    def test_dataset_saves_visual_labels_from_feedback_details(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profiles = Path(tmp) / "profiles.csv"
+            old_profiles_path = dataset.PROFILES_PATH
+            try:
+                dataset.PROFILES_PATH = profiles
+                dataset.save_labeled_profile(
+                    {
+                        "name": "Julia",
+                        "age": 22,
+                        "bio": "",
+                        "interests": [],
+                        "feedback_details": json.dumps({
+                            "visual_face_label": "positive",
+                            "visual_overall_label": "negative",
+                        }),
+                    },
+                    0,
+                )
+                with profiles.open(encoding="utf-8") as f:
+                    row = next(csv.DictReader(f))
+
+                self.assertEqual(row["visual_face_label"], "positive")
+                self.assertEqual(row["visual_overall_label"], "negative")
+            finally:
+                dataset.PROFILES_PATH = old_profiles_path
 
     def test_review_queue_skips_profile_already_trained_by_name_age(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1171,6 +1200,31 @@ class AlgorithmImprovementTests(unittest.TestCase):
 
         self.assertEqual(review_ui._primary_domain_from_details(details), "descriptors")
         self.assertEqual(review_ui._domains_from_feedback_details(details), ["descriptors", "interests"])
+
+    def test_visual_labels_are_photo_domain_and_override_photo_training_label(self):
+        import pandas as pd
+
+        details = {"visual_face_label": "positive", "visual_body_label": "neutral"}
+        df = pd.DataFrame([
+            {
+                "source": "real",
+                "label": 0,
+                "feedback_domain": "bio",
+                "feedback_intensity": "2",
+                "manual_corrected": "1",
+                "ai_decision": "CURTIR",
+                "feedback_details": json.dumps(details),
+            }
+        ])
+        cfg = {"model": {"feedback_weights": {"enabled": True, "max_sample_weight": 100}}}
+
+        self.assertEqual(review_ui._domains_from_feedback_details(details), ["photo"])
+        self.assertEqual(model_training._training_labels(df, "photo").tolist(), [1])
+        self.assertEqual(model_training._training_labels(df, "text").tolist(), [0])
+        self.assertGreater(
+            model_training._sample_weights(df, "photo", cfg)[0],
+            model_training._sample_weights(df, "text", cfg)[0],
+        )
 
     def test_photo_deep_feedback_gets_visual_training_weight(self):
         import pandas as pd
