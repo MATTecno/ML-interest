@@ -32,6 +32,15 @@ data/logs/
 data/debug/
 data/alerts/
 data/reports/
+data/backups/
+data/cloud_runtime/
+data/*.tmp
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite3
+data/*.jsonl
+data/runtime/
 
 # Browser/session state
 data/chrome_profile/
@@ -40,6 +49,7 @@ data/chrome_profile/
 data/network_capture/
 data/photos/
 data/profiles.csv
+data/profiles.csv.bak*
 data/review_queue.csv
 data/review_queue.csv.*
 data/photo_deep_feedback.jsonl
@@ -57,3 +67,6 @@ models/*.pkl
 
 # Accidental shell typo artifact
 =2.2.0
+
+# Local backup files
+*.bak

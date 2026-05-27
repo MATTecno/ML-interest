@@ -41,6 +41,21 @@ def _details(raw: object) -> dict:
         return {}
 
 
+def _truthy_token(value) -> bool:
+    if value is None:
+        return False
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return False
+    try:
+        number = float(text)
+        if number.is_integer():
+            text = str(int(number))
+    except Exception:
+        pass
+    return text.lower() in {"1", "true", "yes", "sim"}
+
+
 def _confusion(y_true: np.ndarray, prob: np.ndarray, threshold: float) -> dict:
     pred = (prob >= threshold).astype(int)
     tp = int(((pred == 1) & (y_true == 1)).sum())
@@ -218,7 +233,7 @@ def evaluate_profiles(config: dict | None = None, write_reports: bool = True) ->
         if _details(raw).get("target_action") == "super_like":
             superlike_count += 1
 
-    manual_corrected = df.get("manual_corrected", pd.Series(dtype=str)).fillna("").astype(str)
+    manual_corrected = df.get("manual_corrected", pd.Series(dtype=str)).fillna("")
     report = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "status": "ok",
@@ -237,7 +252,7 @@ def evaluate_profiles(config: dict | None = None, write_reports: bool = True) ->
         "calibration_bins": calibration,
         "probability_ranges": ranges,
         "corrections": {
-            "manual_corrected": int(manual_corrected.isin(["1", "true", "True"]).sum()),
+            "manual_corrected": int(manual_corrected.map(_truthy_token).sum()),
             "by_domain": _counts(df.get("feedback_domain", pd.Series(dtype=str))),
             "by_correction_type": _counts(df.get("correction_type", pd.Series(dtype=str))),
         },

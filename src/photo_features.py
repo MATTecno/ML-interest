@@ -5,9 +5,11 @@ Roda sincronamente antes da decisão ML.
 
 import io
 import json
+import hashlib
 import os
 import queue
 import threading
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit
@@ -18,6 +20,12 @@ from config import ROOT_DIR, get_photos_config
 from logging_config import get_logger
 
 # Suprime mensagens de log do TensorFlow/oneDNN antes de qualquer import deles
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
@@ -25,8 +33,10 @@ logger = get_logger(__name__)
 
 
 CACHE_PATH = ROOT_DIR / "data" / "photo_feature_cache.json"
+LOCAL_CACHE_PATH = ROOT_DIR / "data" / "photo_local_feature_cache.json"
 _CACHE_LOCK = threading.RLock()
 _CACHE_DATA: dict | None = None
+_LOCAL_CACHE_DATA: dict | None = None
 _EMOTION_ANALYSIS_AVAILABLE: bool | None = None
 _EMOTION_WEIGHT_FILE = Path.home() / ".deepface" / "weights" / "facial_expression_model_weights.h5"
 
@@ -54,6 +64,23 @@ def _load_cache() -> dict:
         return _CACHE_DATA
 
 
+def _load_local_cache() -> dict:
+    global _LOCAL_CACHE_DATA
+    with _CACHE_LOCK:
+        if _LOCAL_CACHE_DATA is not None:
+            return _LOCAL_CACHE_DATA
+        if not LOCAL_CACHE_PATH.exists():
+            _LOCAL_CACHE_DATA = {}
+            return _LOCAL_CACHE_DATA
+        try:
+            with open(LOCAL_CACHE_PATH, encoding="utf-8") as f:
+                _LOCAL_CACHE_DATA = json.load(f)
+        except Exception:
+            logger.exception("Falha ao carregar cache local de features de foto: %s", LOCAL_CACHE_PATH)
+            _LOCAL_CACHE_DATA = {}
+        return _LOCAL_CACHE_DATA
+
+
 def _save_cache(cache: dict) -> None:
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = CACHE_PATH.with_suffix(".tmp")
@@ -65,10 +92,23 @@ def _save_cache(cache: dict) -> None:
         logger.exception("Falha ao salvar cache de features de foto: %s", CACHE_PATH)
 
 
+def _save_local_cache(cache: dict) -> None:
+    LOCAL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LOCAL_CACHE_PATH.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        tmp.replace(LOCAL_CACHE_PATH)
+    except Exception:
+        logger.exception("Falha ao salvar cache local de features de foto: %s", LOCAL_CACHE_PATH)
+
+
 def _jsonable_features(features: dict) -> dict:
     """Converte features para JSON preservando embedding quando existir."""
     serializable = {}
     for key, value in features.items():
+        if key == "_semantic_image_bgr":
+            continue
         if key == "_semantic_embedding":
             continue
         if key == "_embedding":
@@ -85,6 +125,72 @@ def _jsonable_features(features: dict) -> dict:
         except Exception:
             serializable[key] = str(value)
     return serializable
+
+
+def _local_cache_key(path: str | Path, include_embedding: bool) -> str:
+    p = Path(path)
+    try:
+        resolved = p.resolve()
+        rel = str(resolved.relative_to(ROOT_DIR.resolve()))
+    except Exception:
+        resolved = p
+        rel = str(p)
+    try:
+        st = resolved.stat()
+        file_sig = f"{st.st_size}:{st.st_mtime_ns}"
+    except Exception:
+        file_sig = "missing"
+    cfg_sig = hashlib.sha256(
+        json.dumps(get_photos_config(), ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    raw = json.dumps(
+        {
+            "path": rel,
+            "file": file_sig,
+            "include_embedding": bool(include_embedding),
+            "config": cfg_sig,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _get_cached_local_photo(path: str | Path, include_embedding: bool) -> dict | None:
+    key = _local_cache_key(path, include_embedding)
+    cache = _load_local_cache()
+    data = cache.get(key)
+    if not data:
+        return None
+    missing = [feat for feat in _PHOTO_CACHE_REQUIRED_FEATURES if feat not in data]
+    if missing:
+        return None
+    try:
+        source_key = ""
+        try:
+            from photo_semantic_embeddings import semantic_embedding_enabled, source_key_for_path
+
+            if semantic_embedding_enabled():
+                source_key = source_key_for_path(path)
+        except Exception:
+            source_key = ""
+        return _features_from_cache(data, source_key=source_key)
+    except Exception:
+        logger.debug("Falha ao restaurar cache local de foto: %s", path, exc_info=True)
+        return None
+
+
+def _put_cached_local_photo(path: str | Path, include_embedding: bool, features: dict) -> None:
+    if features.get("_analysis_failed"):
+        return
+    key = _local_cache_key(path, include_embedding)
+    with _CACHE_LOCK:
+        cache = _load_local_cache()
+        cache[key] = _jsonable_features(features)
+        if len(cache) > 20000:
+            cache = dict(list(cache.items())[-20000:])
+            global _LOCAL_CACHE_DATA
+            _LOCAL_CACHE_DATA = cache
+        _save_local_cache(cache)
 
 
 def _features_from_cache(data: dict, source_key: str | None = None) -> dict:
@@ -209,12 +315,46 @@ def _download_as_bgr(url: str):
     except urllib.error.HTTPError as e:
         logger.warning("HTTP ao baixar foto: code=%s reason=%s url_path=%s", e.code, e.reason, _cache_key(url), exc_info=True)
         return None
+
     except urllib.error.URLError as e:
         logger.warning("Falha de rede ao baixar foto: reason=%s url_path=%s", e.reason, _cache_key(url), exc_info=True)
         return None
     except Exception as e:
         logger.exception("Erro inesperado no download da foto url_path=%s", _cache_key(url))
         return None
+
+
+def _analysis_workers_with_backpressure(requested_workers: int) -> int:
+    try:
+        from config import load_config
+        from resource_guard import get_system_resource_snapshot, is_memory_pressure, memory_relief_reached
+
+        cfg = load_config()
+        snap = get_system_resource_snapshot()
+        pressure, reason, _ = is_memory_pressure(cfg, snapshot=snap)
+        relief, relief_reason, _ = memory_relief_reached(cfg, snap)
+        swiper_cfg = cfg.get("swiper", {}) or {}
+        try:
+            cpu_threshold = float(swiper_cfg.get("cpu_alert_threshold_percent", 0) or 0)
+        except Exception:
+            cpu_threshold = 0.0
+        cpu_high = cpu_threshold > 0 and float(snap.get("cpu_pct", 0.0) or 0.0) >= cpu_threshold
+        if pressure or cpu_high or not relief:
+            logger.warning(
+                "Backpressure na analise de fotos: workers=%s->1 pressure=%s relief=%s cpu_high=%s reason=%s cpu=%.1f mem=%.1f%% swap=%.1f%%",
+                requested_workers,
+                pressure,
+                relief,
+                cpu_high,
+                reason or relief_reason,
+                float(snap.get("cpu_pct", 0.0) or 0.0),
+                float(snap.get("mem_used_pct", 0.0) or 0.0),
+                float(snap.get("swap_used_pct", 0.0) or 0.0),
+            )
+            return 1
+    except Exception:
+        logger.debug("Backpressure de analise indisponivel", exc_info=True)
+    return requested_workers
 
 
 def _load_path_as_bgr(path: str | Path):
@@ -1162,6 +1302,69 @@ def _semantic_embedding_features_for_bgr(url: str, img_bgr) -> dict:
         return features
 
 
+def _semantic_embedding_enabled_for_batch() -> bool:
+    try:
+        from photo_semantic_embeddings import semantic_embedding_enabled
+
+        return semantic_embedding_enabled()
+    except Exception:
+        return False
+
+
+def _apply_semantic_embeddings_batch(results: list[dict]) -> None:
+    items = []
+    skipped = 0
+    for item in results:
+        img_bgr = item.get("_semantic_image_bgr")
+        source_url = item.get("_source_url", "")
+        if img_bgr is None or not source_url or item.get("_analysis_failed"):
+            item.pop("_semantic_image_bgr", None)
+            skipped += 1
+            continue
+        try:
+            from photo_semantic_embeddings import source_key_for_url
+
+            items.append((source_url, source_key_for_url(source_url), img_bgr))
+        except Exception:
+            item.pop("_semantic_image_bgr", None)
+            skipped += 1
+
+    if not items:
+        logger.info("CLIP semantic batch ignorado: candidates=0 skipped=%s", skipped)
+        return
+
+    started = time.perf_counter()
+    try:
+        from photo_semantic_embeddings import embeddings_for_bgr_sources
+
+        embeddings = embeddings_for_bgr_sources(items)
+    except Exception:
+        logger.debug("Falha no batch de embeddings semanticos visuais", exc_info=True)
+        embeddings = {}
+
+    saved = 0
+    for item in results:
+        source_url = item.get("_source_url", "")
+        img_bgr = item.pop("_semantic_image_bgr", None)
+        if img_bgr is None or not source_url or item.get("_analysis_failed"):
+            continue
+        embedding = embeddings.get(source_url)
+        if embedding is not None:
+            item["_semantic_embedding"] = embedding
+            item["photo_semantic_embedding_saved"] = 1.0
+            item["photo_carousel_useful_count"] = 1.0
+            saved += 1
+        _put_cached_photo(source_url, item)
+    logger.info(
+        "CLIP semantic batch aplicado ao perfil: candidates=%s saved=%s missing=%s skipped=%s elapsed=%.2fs",
+        len(items),
+        saved,
+        max(0, len(items) - saved),
+        skipped,
+        time.perf_counter() - started,
+    )
+
+
 def _semantic_aggregate_from_results(results: list[dict]) -> tuple[object | None, dict]:
     try:
         from photo_semantic_embeddings import aggregate_embeddings
@@ -1177,7 +1380,36 @@ def _semantic_aggregate_from_results(results: list[dict]) -> tuple[object | None
         return None, _carousel_default_features()
 
 
-def _analyze_bgr(img_bgr, include_embedding: bool | None = None) -> dict:
+def _analyze_photo_for_set(
+    url: str,
+    profile_age: int,
+    include_semantic: bool,
+    keep_image_for_semantic: bool,
+    photo_index: int = 0,
+) -> dict:
+    try:
+        import inspect
+
+        sig = inspect.signature(analyze_photo)
+        if "include_semantic" not in sig.parameters or "keep_image_for_semantic" not in sig.parameters:
+            return analyze_photo(url, profile_age)
+    except Exception:
+        pass
+    kwargs = {
+        "include_semantic": include_semantic,
+        "keep_image_for_semantic": keep_image_for_semantic,
+    }
+    try:
+        import inspect
+
+        if "photo_index" in inspect.signature(analyze_photo).parameters:
+            kwargs["photo_index"] = photo_index
+    except Exception:
+        pass
+    return analyze_photo(url, profile_age, **kwargs)
+
+
+def _analyze_bgr(img_bgr, include_embedding: bool | None = None, photo_index: int | None = None) -> dict:
     """
     Analisa uma imagem já carregada em BGR e retorna features numéricas.
     Retorna defaults neutros se a análise falhar — nunca bloqueia o pipeline.
@@ -1213,6 +1445,7 @@ def _analyze_bgr(img_bgr, include_embedding: bool | None = None) -> dict:
         cfg = get_photos_config()
         detector_backend = str(cfg.get("detector_backend", "opencv") or "opencv")
         detector_fallback_backend = str(cfg.get("detector_fallback_backend", "") or "").strip()
+        detector_fallback_policy = str(cfg.get("detector_fallback_policy", "always") or "always").strip().lower()
         embedding_strategy = str(cfg.get("embedding_strategy", "best_photo") or "best_photo")
         enable_embedding = bool(cfg.get("enable_face_embedding", False))
         if include_embedding is None:
@@ -1260,11 +1493,84 @@ def _analyze_bgr(img_bgr, include_embedding: bool | None = None) -> dict:
             r, face_conf = {}, 0.0
 
         used_backend = detector_backend
-        if (
+        fallback_allowed = (
             face_conf < 0.5
             and detector_fallback_backend
             and detector_fallback_backend != detector_backend
-        ):
+        )
+        if fallback_allowed and detector_fallback_policy in {"off", "none", "disabled", "never"}:
+            fallback_allowed = False
+            logger.info(
+                "Fallback de detector desativado por policy: backend=%s fallback=%s conf=%.3f policy=%s",
+                detector_backend,
+                detector_fallback_backend,
+                face_conf,
+                detector_fallback_policy,
+            )
+
+        max_fallback_photo_index = 0
+        try:
+            max_fallback_photo_index = int(cfg.get("detector_fallback_max_photo_index", 0) or 0)
+        except Exception:
+            max_fallback_photo_index = 0
+        if fallback_allowed and max_fallback_photo_index > 0 and photo_index and photo_index > max_fallback_photo_index:
+            fallback_allowed = False
+            logger.info(
+                "Fallback de detector pulado por indice da foto: backend=%s fallback=%s conf=%.3f photo_index=%s max=%s",
+                detector_backend,
+                detector_fallback_backend,
+                face_conf,
+                photo_index,
+                max_fallback_photo_index,
+            )
+
+        first_photo_policy = detector_fallback_policy in {
+            "first_photo",
+            "first_photo_only",
+            "first_photo_selective",
+            "first_photo_promising",
+        }
+        if fallback_allowed and first_photo_policy and photo_index and photo_index > 1:
+            fallback_allowed = False
+            logger.info(
+                "Fallback de detector pulado fora da primeira foto: backend=%s fallback=%s conf=%.3f photo_index=%s policy=%s",
+                detector_backend,
+                detector_fallback_backend,
+                face_conf,
+                photo_index,
+                detector_fallback_policy,
+            )
+
+        if fallback_allowed and detector_fallback_policy in {
+            "selective",
+            "promising",
+            "promising_only",
+            "first_photo_selective",
+            "first_photo_promising",
+        }:
+            min_sharpness = float(cfg.get("detector_fallback_min_sharpness", 0.35) or 0)
+            min_brightness = float(cfg.get("detector_fallback_min_brightness", 0.12) or 0)
+            min_colorfulness = float(cfg.get("detector_fallback_min_colorfulness", 0.08) or 0)
+            sharpness = float(image_quality_features.get("photo_image_sharpness", 0.0) or 0.0)
+            brightness = float(image_quality_features.get("photo_image_brightness", 0.0) or 0.0)
+            colorfulness = float(image_quality_features.get("photo_image_colorfulness", 0.0) or 0.0)
+            fallback_allowed = (
+                sharpness >= min_sharpness
+                and brightness >= min_brightness
+                and colorfulness >= min_colorfulness
+            )
+            if not fallback_allowed:
+                logger.info(
+                    "Fallback de detector pulado por seletividade: backend=%s fallback=%s conf=%.3f sharp=%.3f bright=%.3f color=%.3f",
+                    detector_backend,
+                    detector_fallback_backend,
+                    face_conf,
+                    sharpness,
+                    brightness,
+                    colorfulness,
+                )
+
+        if fallback_allowed:
             try:
                 logger.info(
                     "Rosto nao confirmado com backend=%s conf=%.3f; tentando fallback=%s",
@@ -1363,7 +1669,13 @@ def _analyze_bgr(img_bgr, include_embedding: bool | None = None) -> dict:
         return _default_features()
 
 
-def analyze_photo(url: str, profile_age: int = 0) -> dict:
+def analyze_photo(
+    url: str,
+    profile_age: int = 0,
+    include_semantic: bool = True,
+    keep_image_for_semantic: bool = False,
+    photo_index: int | None = None,
+) -> dict:
     """
     Analisa a foto remota e retorna features numéricas para o modelo ML.
     """
@@ -1383,7 +1695,12 @@ def analyze_photo(url: str, profile_age: int = 0) -> dict:
 
     if timeout_s <= 0:
         try:
-            result = _analyze_photo_uncached(url)
+            result = _analyze_photo_uncached(
+                url,
+                include_semantic=include_semantic,
+                keep_image_for_semantic=keep_image_for_semantic,
+                photo_index=photo_index,
+            )
             logger.info(
                 "Analise de foto concluida key=%s has_face=%s woman=%.3f elapsed=%.3fs",
                 _cache_key(url),
@@ -1400,7 +1717,15 @@ def analyze_photo(url: str, profile_age: int = 0) -> dict:
 
     def _worker() -> None:
         try:
-            result_queue.put(_analyze_photo_uncached(url), block=False)
+            result_queue.put(
+                _analyze_photo_uncached(
+                    url,
+                    include_semantic=include_semantic,
+                    keep_image_for_semantic=keep_image_for_semantic,
+                    photo_index=photo_index,
+                ),
+                block=False,
+            )
         except BaseException as exc:
             try:
                 result_queue.put(exc, block=False)
@@ -1443,16 +1768,27 @@ def analyze_photo(url: str, profile_age: int = 0) -> dict:
     return result
 
 
-def _analyze_photo_uncached(url: str) -> dict:
+def _analyze_photo_uncached(
+    url: str,
+    include_semantic: bool = True,
+    keep_image_for_semantic: bool = False,
+    photo_index: int | None = None,
+) -> dict:
     """Baixa, analisa e grava cache. Deve ser chamado dentro do worker com timeout."""
     img_bgr = _download_as_bgr(url)
     if img_bgr is None:
         logger.warning("Analise de foto sem imagem key=%s", _cache_key(url))
         return {**_unavailable_features("download_failed"), "_download_failed": True}
 
-    features = _analyze_bgr(img_bgr)
-    features.update(_semantic_embedding_features_for_bgr(url, img_bgr))
-    _put_cached_photo(url, features)
+    features = _analyze_bgr(img_bgr, photo_index=photo_index)
+    if include_semantic:
+        features.update(_semantic_embedding_features_for_bgr(url, img_bgr))
+        _put_cached_photo(url, features)
+    else:
+        if keep_image_for_semantic:
+            features["_semantic_image_bgr"] = img_bgr
+        if not _semantic_embedding_enabled_for_batch():
+            _put_cached_photo(url, features)
     return features
 
 
@@ -1475,6 +1811,10 @@ def analyze_local_photo(path: str | Path, profile_age: int = 0, include_embeddin
     Usado para backfill do histórico em data/photos.
     """
     logger.info("Analise de foto local iniciada: %s", path)
+    cached = _get_cached_local_photo(path, include_embedding)
+    if cached is not None:
+        logger.info("Analise de foto local retornada do cache: %s has_face=%s", path, cached.get("photo_has_face"))
+        return cached
     # Em backfills locais existe apenas uma imagem por chamada; forçamos o
     # embedding para tirar históricos antigos do fallback neutro de 0.5.
     img_bgr = _load_path_as_bgr(path)
@@ -1490,6 +1830,7 @@ def analyze_local_photo(path: str | Path, profile_age: int = 0, include_embeddin
                 features["photo_carousel_useful_count"] = 1.0
     except Exception:
         logger.debug("Falha ao enriquecer foto local com embedding semantico: %s", path, exc_info=True)
+    _put_cached_local_photo(path, include_embedding, features)
     logger.info("Analise de foto local concluida: %s has_face=%s", path, features.get("photo_has_face"))
     return features
 
@@ -1666,19 +2007,29 @@ def analyze_photos(urls: list[str], profile_age: int = 0, max_photos: int = 4) -
     import time
     started_at = time.perf_counter()
     cfg = get_photos_config()
-    workers = max(1, min(len(to_analyze), int(cfg.get("analysis_parallel_workers", 4))))
+    requested_workers = max(1, min(len(to_analyze), int(cfg.get("analysis_parallel_workers", 4))))
+    workers = _analysis_workers_with_backpressure(requested_workers)
+    semantic_batch_enabled = _semantic_embedding_enabled_for_batch()
     logger.info(
-        "Analise de conjunto de fotos iniciada: count=%s max=%s workers=%s",
+        "Analise de conjunto de fotos iniciada: count=%s max=%s workers=%s semantic_batch=%s",
         len(to_analyze),
         max_photos,
         workers,
+        semantic_batch_enabled,
     )
 
     results = []
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="photo-set") as executor:
         future_to_url = {
-            executor.submit(analyze_photo, url, profile_age): url
-            for url in to_analyze
+            executor.submit(
+                _analyze_photo_for_set,
+                url,
+                profile_age,
+                not semantic_batch_enabled,
+                semantic_batch_enabled,
+                photo_index,
+            ): url
+            for photo_index, url in enumerate(to_analyze, start=1)
         }
         for future in as_completed(future_to_url):
             url = future_to_url[future]
@@ -1691,6 +2042,9 @@ def analyze_photos(urls: list[str], profile_age: int = 0, max_photos: int = 4) -
                 result = _unavailable_features("future_exception")
                 result["_source_url"] = url
                 results.append(result)
+
+    if semantic_batch_enabled:
+        _apply_semantic_embeddings_batch(results)
 
     content_candidates = [r for r in results if _content_photo_score(r) > 0]
     best_content = max(content_candidates, key=_content_photo_score) if content_candidates else None

@@ -89,7 +89,11 @@ def _as_float(value, default: float = 0.0) -> float:
 def _is_history_review(row: dict) -> bool:
     mode = str(row.get("review_mode") or "").strip().lower()
     source = str(row.get("source") or "").strip().lower()
-    return mode == "history" or source == "history_review"
+    return mode in {"history", "quick_agree_recheck"} or source == "history_review"
+
+
+def _is_recheck_review(row: dict) -> bool:
+    return str(row.get("review_mode") or "").strip().lower() == "quick_agree_recheck"
 
 
 def _read_review_rows() -> list[dict]:
@@ -1129,7 +1133,7 @@ def skip_duplicate_history_reviews() -> int:
             continue
         if idx in to_skip:
             continue
-        if _strong_review_dedupe_keys_from_row(row) & handled_review_keys:
+        if not _is_recheck_review(row) and _strong_review_dedupe_keys_from_row(row) & handled_review_keys:
             to_skip[idx] = "duplicado: perfil ja foi revisado na fila normal"
 
     now = datetime.now().isoformat(timespec="seconds")

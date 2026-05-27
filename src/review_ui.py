@@ -12,7 +12,7 @@ import threading
 import unicodedata
 import urllib.parse
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import time
 
@@ -21,9 +21,15 @@ import yaml
 from body_photo_rules import BODY_MEASUREMENT_MIN_STRENGTH, body_measurement_strength
 from config import ROOT_DIR, CONFIG_PATH
 from logging_config import get_logger, setup_logging
-from model_training import train_model
+from model_training import load_model, train_model
 from model_evaluation import LATEST_JSON
-from text_preferences import score_profile_text
+from text_preferences import (
+    append_signal_feedback,
+    append_signal_feedback_batch,
+    score_profile_text,
+    signal_feedback_counts,
+    signal_training_candidates,
+)
 from photo_deep_feedback import (
     PHOTO_DEEP_TAG_GROUPS,
     append_deep_record,
@@ -107,6 +113,90 @@ def _get_retrain_status() -> dict[str, str | bool]:
         if not status.get("message"):
             status["message"] = "Retreinando modelo em background. Pode continuar revisando."
     return status
+
+
+def _domains_from_feedback_details(details: dict) -> list[str]:
+    domains: list[str] = []
+
+    def add(domain: str) -> None:
+        if domain and domain not in domains:
+            domains.append(domain)
+
+    if (
+        details.get("photo_score_adjustment")
+        or details.get("photo_reason")
+        or details.get("photo_positive_details")
+        or details.get("photo_negative_details")
+        or details.get("body_frame_correction")
+        or details.get("body_build_correction")
+    ):
+        add("photo")
+    if details.get("descriptor_detail") or details.get("descriptor_positive_details") or details.get("descriptor_negative_details"):
+        add("descriptors")
+    if details.get("descriptor_not_positive") or details.get("descriptor_not_negative"):
+        add("descriptors")
+    if details.get("selected_interests") or details.get("interest_not_positive") or details.get("interest_not_negative"):
+        add("interests")
+    if details.get("bio_detail") or details.get("bio_not_positive") or details.get("bio_not_negative"):
+        add("bio")
+    return domains
+
+
+def _primary_domain_from_details(details: dict, fallback: str = "other") -> str:
+    domains = _domains_from_feedback_details(details)
+    return domains[0] if domains else fallback
+
+
+def _maybe_start_review_auto_retrain(reason: str = "review_saved") -> bool:
+    cfg = _load_raw_config()
+    retrain_every = int((cfg.get("model", {}) or {}).get("retrain_every", 10) or 10)
+    if retrain_every <= 0:
+        return False
+    try:
+        from model import count_trainable_real_profiles
+
+        current_count = count_trainable_real_profiles()
+        model_data = load_model()
+        trained_count = int((model_data or {}).get("n_samples", 0) or 0)
+    except Exception:
+        logger.debug("Auto-retreino pos-review indisponivel", exc_info=True)
+        return False
+
+    pending = current_count - trained_count
+    if pending < retrain_every:
+        logger.info(
+            "Auto-retreino pos-review aguardando mais dados: pending=%s retrain_every=%s reason=%s",
+            pending,
+            retrain_every,
+            reason,
+        )
+        return False
+    if not _RETRAIN_LOCK.acquire(blocking=False):
+        logger.info("Auto-retreino pos-review ignorado: retreino ja em andamento")
+        return False
+
+    _mark_retrain_started()
+
+    def _run() -> None:
+        try:
+            logger.info(
+                "Auto-retreino pos-review iniciado: pending=%s current=%s trained=%s reason=%s",
+                pending,
+                current_count,
+                trained_count,
+                reason,
+            )
+            train_model()
+            logger.info("Auto-retreino pos-review concluido")
+            _mark_retrain_finished(True)
+        except Exception as exc:
+            logger.exception("Erro no auto-retreino pos-review")
+            _mark_retrain_finished(False, str(exc))
+        finally:
+            _RETRAIN_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True, name="review-auto-retrain").start()
+    return True
 
 
 def _render_retrain_status_notice() -> str:
@@ -475,7 +565,7 @@ def _body_photo_path(row: dict) -> str:
     if not path.exists():
         return ""
     if _same_local_photo(rel, body_rel):
-        logger.info("Foto corporal omitida da review porque duplica a principal: %s", body_rel)
+        logger.debug("Foto corporal omitida da review porque duplica a principal: %s", body_rel)
         return ""
     return body_rel
 
@@ -2042,9 +2132,13 @@ def _render_card(row: dict, prefs: dict) -> str:
     ai_label = "curtiu" if original in {"CURTIR", "SUPER LIKE"} else "passou"
     review_mode = str(row.get("review_mode") or "").strip().lower()
     origin_text = (
-        f"histórico salvo em {_esc(row.get('created_at',''))}"
-        if review_mode == "history"
-        else f"IA {ai_label} automaticamente em {_esc(row.get('created_at',''))}"
+        f"concordância antiga para reavaliar em {_esc(row.get('created_at',''))}"
+        if review_mode == "quick_agree_recheck"
+        else (
+            f"histórico salvo em {_esc(row.get('created_at',''))}"
+            if review_mode == "history"
+            else f"IA {ai_label} automaticamente em {_esc(row.get('created_at',''))}"
+        )
     )
 
     if descriptors:
@@ -3302,6 +3396,109 @@ _CSS = """
       border-color: var(--ink);
     }
     .tab-panel[hidden] { display: none !important; }
+    .signal-train-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .signal-train-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .signal-train-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 12px;
+    }
+    .signal-train-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--card);
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-width: 0;
+    }
+    .signal-train-main h2 {
+      margin: 6px 0 8px;
+      font-size: 18px;
+      line-height: 1.18;
+      overflow-wrap: anywhere;
+    }
+    .signal-kind {
+      display: inline-flex;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 11px;
+      font-weight: 800;
+      color: var(--muted);
+      background: #fffdf8;
+    }
+    .signal-train-meta,
+    .signal-examples {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .signal-train-meta span,
+    .signal-example {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 7px;
+      background: rgba(255,255,255,.72);
+    }
+    .signal-train-meta .like { color: var(--match); border-color: #86efac; background: #f0fdf4; }
+    .signal-train-meta .pass { color: var(--neg); border-color: #fca5a5; background: #fff1f2; }
+    .signal-train-meta .mid { color: var(--mid); border-color: #fde68a; background: #fffdf0; }
+    .signal-train-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      align-items: center;
+      margin-top: auto;
+    }
+	    .signal-batch-actions {
+	      display: flex;
+	      flex-wrap: wrap;
+	      gap: 8px;
+	      align-items: center;
+	    }
+    .signal-explicit {
+      flex: 1 1 100%;
+      color: var(--muted);
+      font-size: 12px;
+    }
+	    .signal-train-card.queued {
+	      border-color: var(--agree);
+	      box-shadow: 0 0 0 2px rgba(91,127,181,.16);
+	    }
+	    .signal-train-card.saving {
+	      border-color: var(--agree);
+	      opacity: .68;
+	      pointer-events: none;
+	      box-shadow: 0 0 0 2px rgba(91,127,181,.14);
+	    }
+	    .signal-train-card.save-error {
+	      border-color: var(--neg);
+	      box-shadow: 0 0 0 2px rgba(185,74,72,.14);
+	    }
+	    .signal-choice:disabled {
+	      cursor: wait;
+	      opacity: .72;
+	    }
+	    .signal-choice.selected {
+	      outline: 3px solid rgba(29,27,22,.18);
+	      outline-offset: 2px;
+	    }
     .deep-intro code { font-size: 12px; font-family: ui-monospace, monospace; }
     .deep-toolbar {
       display: flex;
@@ -3761,6 +3958,176 @@ def _render_body_train_panel(page: int = 0) -> str:
     )
 
 
+_SIGNAL_TYPE_LABELS = {
+    "all": "todos",
+    "interest": "interesses",
+    "bio": "bio",
+    "descriptor": "descritores",
+}
+
+_SIGNAL_POLARITY_LABELS = {
+    "positive": "positivo",
+    "neutral": "neutro",
+    "negative": "negativo",
+}
+
+
+def _signal_type_label(signal_type: str) -> str:
+    return _SIGNAL_TYPE_LABELS.get(str(signal_type or "").strip().lower(), signal_type or "")
+
+
+def _signal_train_stats() -> dict:
+    counts = signal_feedback_counts()
+    by_type = {"interest": 0, "bio": 0, "descriptor": 0}
+    total = 0
+    for (kind, _norm), item in counts.items():
+        value = int(item.get("total", 0) or 0)
+        total += value
+        if kind in by_type:
+            by_type[kind] += value
+    return {"total": total, **by_type}
+
+
+def _render_signal_examples(examples: list[dict]) -> str:
+    if not examples:
+        return '<span class="muted">sem exemplos</span>'
+    bits = []
+    for ex in examples[:3]:
+        name = str(ex.get("name") or "").strip() or "perfil"
+        age = str(ex.get("age") or "").strip()
+        label = "curtiu" if str(ex.get("label")) == "1" else "passou"
+        shown = f"{name}, {age}" if age else name
+        bits.append(f'<span class="signal-example">{_esc(shown)} · {_esc(label)}</span>')
+    return "".join(bits)
+
+
+def _signal_train_key(item: dict) -> str:
+    kind = str(item.get("signal_type") or "").strip().lower()
+    value = str(item.get("signal_value") or "").strip()
+    signal_norm = str(item.get("signal_norm") or value)
+    return f"{kind}:{signal_norm}"
+
+
+def _parse_signal_shown_keys(values: list[str]) -> set[str]:
+    shown: set[str] = set()
+    for raw in values:
+        raw_value = str(raw or "")
+        if not raw_value:
+            continue
+        # Compatibilidade com a versao anterior do JS, que juntava ids com
+        # virgula. Alguns ids tambem tem virgula, como "Ingles, Portugues".
+        parts = re.split(r",(?=(?:interest|bio|descriptor):)", raw_value)
+        shown.update(part.strip() for part in parts if part.strip())
+    return shown
+
+
+def _render_signal_train_card(item: dict, signal_filter: str, page: int) -> str:
+    kind = str(item.get("signal_type") or "").strip().lower()
+    value = str(item.get("signal_value") or "").strip()
+    signal_key = _signal_train_key(item)
+    score = float(item.get("learned_score", 0.5) or 0.5)
+    score_pct = int(round(score * 100))
+    explicit = item.get("explicit_feedback") or {}
+    explicit_total = int(explicit.get("total", 0) or 0)
+    pos = int(explicit.get("positive", 0) or 0)
+    neu = int(explicit.get("neutral", 0) or 0)
+    neg = int(explicit.get("negative", 0) or 0)
+    occurrences = int(item.get("occurrences", 0) or 0)
+    likes = int(item.get("likes", 0) or 0)
+    dislikes = int(item.get("dislikes", 0) or 0)
+    examples = _render_signal_examples(item.get("examples") or [])
+    score_cls = "like" if score >= 0.62 else "pass" if score <= 0.38 else "mid"
+    return f"""
+    <article class="signal-train-card" data-signal-key="{_esc(signal_key)}">
+      <div class="signal-train-main">
+        <span class="signal-kind">{_esc(_signal_type_label(kind))}</span>
+        <h2>{_esc(value)}</h2>
+        <div class="signal-train-meta">
+          <span>{occurrences} ocorrência(s)</span>
+          <span>{likes} curtida(s)</span>
+          <span>{dislikes} passada(s)</span>
+          <span class="{score_cls}">score {score_pct}%</span>
+        </div>
+        <div class="signal-examples">{examples}</div>
+      </div>
+      <div class="signal-train-actions"
+           data-signal-type="{_esc(kind)}"
+           data-signal-value="{_esc(value)}"
+           data-occurrences="{occurrences}"
+           data-likes="{likes}"
+           data-dislikes="{dislikes}">
+        <span class="signal-explicit">marcado: {explicit_total} · +{pos} · ={neu} · -{neg}</span>
+        <button type="button" class="btn agree signal-choice" data-polarity="positive">Gosto</button>
+        <button type="button" class="btn ghost signal-choice" data-polarity="neutral">Neutro</button>
+        <button type="button" class="btn pass signal-choice" data-polarity="negative">Não gosto</button>
+      </div>
+    </article>
+    """
+
+
+def _render_signal_train_panel(signal_filter: str = "all", page: int = 0) -> str:
+    signal_filter = str(signal_filter or "all").strip().lower()
+    if signal_filter not in {"all", "interest", "bio", "descriptor"}:
+        signal_filter = "all"
+    page = max(0, int(page or 0))
+    per_page = 24
+    candidates = signal_training_candidates(signal_filter, limit=600)
+    total = len(candidates)
+    start_idx = page * per_page
+    visible = candidates[start_idx:start_idx + per_page]
+    end = start_idx + len(visible)
+    stats = _signal_train_stats()
+
+    filter_links = []
+    for key in ("all", "interest", "bio", "descriptor"):
+        active = " active" if key == signal_filter else ""
+        href = "/?tab=signal-train" if key == "all" else f"/?tab=signal-train&signal_type={key}"
+        count = stats.get(key, stats.get("total", 0)) if key != "all" else stats.get("total", 0)
+        filter_links.append(
+            f'<a class="fchip{active}" href="{href}">{_esc(_signal_type_label(key))} <b>{count}</b></a>'
+        )
+
+    if not visible:
+        cards = """
+        <div class="empty">
+          <h2>Nenhum sinal pendente</h2>
+          <p>Os sinais deste tipo já têm feedback suficiente ou ainda aparecem pouco no histórico.</p>
+        </div>"""
+    else:
+        cards = "".join(_render_signal_train_card(item, signal_filter, page) for item in visible)
+
+    prev_btn = (
+        f'<a href="/?tab=signal-train&signal_type={signal_filter}&signal_page={page - 1}" class="btn ghost">← Anterior</a>'
+        if page > 0 else ""
+    )
+    next_btn = (
+        f'<a href="/?tab=signal-train&signal_type={signal_filter}&signal_page={page + 1}" class="btn ghost">Próximos →</a>'
+        if end < total else ""
+    )
+    shown = f"{start_idx + 1}-{end}" if visible else "0"
+    return f"""
+    <div class="signal-train-head">
+      <div class="filter-group">
+        <span class="filter-label">Sinais</span>
+        {"".join(filter_links)}
+      </div>
+      <div class="signal-batch-actions">
+        <form method="post" action="/retrain" style="display:inline">
+          <input type="hidden" name="redirect_tab" value="signal-train">
+          <button class="btn ghost">Retreinar modelo agora</button>
+        </form>
+      </div>
+    </div>
+    <div class="signal-train-summary">
+      <span class="pill">candidatos: <b id="signal-candidate-total">{total}</b></span>
+      <span class="pill">mostrando: <b>{shown}</b></span>
+      <span class="pill">feedbacks atômicos: <b id="signal-feedback-total">{stats.get("total", 0)}</b></span>
+    </div>
+    <div class="signal-train-grid">{cards}</div>
+    <div class="bt-pagination">{prev_btn}{next_btn}</div>
+    """
+
+
 def _render_filter_bar(pending: list[dict], top_descriptors: list[str], sort_mode: str = "priority") -> str:
     n_like = sum(1 for r in pending if _decision_label(r.get("original_label", r.get("label", ""))) in {"CURTIR", "SUPER LIKE"})
     n_pass = len(pending) - n_like
@@ -3855,12 +4222,14 @@ def _render_page(
     show_all: bool = False,
     sort_mode: str = "priority",
     bt_page: int = 0,
+    signal_type: str = "all",
+    signal_page: int = 0,
 ) -> bytes:
     prefs = _load_prefs()
     photo_deep_enabled = _photo_deep_enabled()
     if not photo_deep_enabled and initial_tab == "photo-deep":
         initial_tab = ""
-    if initial_tab not in ("photo-deep", "body-train"):
+    if initial_tab not in ("photo-deep", "body-train", "signal-train"):
         initial_tab = initial_tab if initial_tab == "photo-deep" else ""
     if sort_mode not in ("priority", "uncertain", "confident", "recent"):
         sort_mode = "priority"
@@ -3875,15 +4244,18 @@ def _render_page(
     deep_n = count_deep_records() if photo_deep_enabled else 0
     _, bt_total = _body_train_profiles(page=0, per_page=1)
     initial_tab_json = json.dumps(initial_tab or "")
-    main_hidden = initial_tab in ("photo-deep", "body-train")
+    main_hidden = initial_tab in ("photo-deep", "body-train", "signal-train")
     deep_hidden = initial_tab != "photo-deep"
     bt_hidden = initial_tab != "body-train"
+    signal_hidden = initial_tab != "signal-train"
     main_attr = " hidden" if main_hidden else ""
     deep_attr = " hidden" if deep_hidden else ""
     bt_attr = " hidden" if bt_hidden else ""
+    signal_attr = " hidden" if signal_hidden else ""
     tab_main_active = "" if main_hidden else " active"
     tab_deep_active = " active" if not deep_hidden else ""
     tab_bt_active = " active" if not bt_hidden else ""
+    tab_signal_active = " active" if not signal_hidden else ""
     if photo_deep_enabled and initial_tab == "photo-deep":
         deep_paths = list_saved_photo_paths(None, body_only=True)
         deep_panel = _render_photo_deep_panel(deep_paths, selected_photo)
@@ -3951,6 +4323,10 @@ def _render_page(
     bt_panel_html = _render_body_train_panel(page=bt_page) if not bt_hidden else (
         '<div class="bt-empty"><p>Abra esta aba para carregar os perfis.</p></div>'
     )
+    signal_lazy_attr = ' data-lazy="1"' if signal_hidden else ""
+    signal_panel_html = _render_signal_train_panel(signal_type, signal_page) if not signal_hidden else (
+        '<div class="bt-empty"><p>Abra esta aba para carregar os sinais.</p></div>'
+    )
     bt_count_pill = f' <span style="font-size:10px;opacity:.7">({bt_total})</span>' if bt_total else ""
     subtitle = (
         "Correção pós-swipe para o treino principal."
@@ -3997,6 +4373,7 @@ def _render_page(
       <button type="button" class="tab-btn{tab_main_active}" data-tab="main" role="tab" aria-controls="tab-main" aria-selected="{str(not main_hidden).lower()}">Revisão pós-swipe</button>
       {tab_deep_button}
       <button type="button" class="tab-btn{tab_bt_active}" data-tab="body-train" role="tab" aria-controls="tab-body-train" aria-selected="{str(not bt_hidden).lower()}">Treino corporal<span id="bt-count-pill">{bt_total if bt_total else ""}</span></button>
+      <button type="button" class="tab-btn{tab_signal_active}" data-tab="signal-train" role="tab" aria-controls="tab-signal-train" aria-selected="{str(not signal_hidden).lower()}">Treino de sinais</button>
     </nav>
     <div id="tab-main" class="tab-panel"{main_attr} role="tabpanel">
     <div class="toolbar">
@@ -4024,10 +4401,13 @@ def _render_page(
     <div id="tab-body-train" class="tab-panel"{bt_attr}{bt_lazy_attr} role="tabpanel">
       {bt_panel_html}
     </div>
+    <div id="tab-signal-train" class="tab-panel"{signal_attr}{signal_lazy_attr} role="tabpanel">
+      {signal_panel_html}
+    </div>
   </main>
   <script>
     function setReviewTab(which) {{
-      ['tab-main','tab-photo-deep','tab-body-train'].forEach(function(id) {{
+      ['tab-main','tab-photo-deep','tab-body-train','tab-signal-train'].forEach(function(id) {{
         var el = document.getElementById(id);
         if (el) el.hidden = (id !== 'tab-' + which);
       }});
@@ -4058,10 +4438,19 @@ def _render_page(
             return;
           }}
         }}
+        if (target === 'signal-train') {{
+          var panel = document.getElementById('tab-signal-train');
+          if (panel && panel.getAttribute('data-lazy') === '1') {{
+            var lazyUrl = new URL(location.href);
+            lazyUrl.searchParams.set('tab', 'signal-train');
+            location.href = lazyUrl.pathname + lazyUrl.search + lazyUrl.hash;
+            return;
+          }}
+        }}
         setReviewTab(target);
         try {{
           var u = new URL(location.href);
-          if (target === 'photo-deep' || target === 'body-train') u.searchParams.set('tab', target);
+          if (target === 'photo-deep' || target === 'body-train' || target === 'signal-train') u.searchParams.set('tab', target);
           else u.searchParams.delete('tab');
           history.replaceState(null, '', u.pathname + u.search + u.hash);
         }} catch (e) {{}}
@@ -4070,6 +4459,7 @@ def _render_page(
     var tabInit = {initial_tab_json};
     if (tabInit === 'photo-deep') setReviewTab('photo-deep');
     if (tabInit === 'body-train') setReviewTab('body-train');
+    if (tabInit === 'signal-train') setReviewTab('signal-train');
 
     var dsel = document.getElementById('deep-photo-path');
     var dimg = document.getElementById('deep-photo-preview');
@@ -4289,6 +4679,13 @@ def _render_page(
       Array.from(document.querySelectorAll('.card[id^="card-"]'))
         .map(function(card) {{ return card.id.replace(/^card-/, ''); }})
     );
+    var _reviewPageLimit = {REVIEW_PAGE_LIMIT};
+    var _nextReviewInFlight = false;
+    var _reviewNextExhausted = false;
+
+    function _visibleReviewCardCount() {{
+      return document.querySelectorAll('#tab-main > .card[id^="card-"]').length;
+    }}
 
     function _bindReviewAjax(form) {{
       if (!form || form.dataset.ajaxBound === '1') return;
@@ -4327,7 +4724,7 @@ def _render_page(
               card.style.transform = 'translateY(-6px)';
               setTimeout(function() {{
                 card.remove();
-                _appendNextReviewCard();
+                _fillReviewSlots();
               }}, 190);
             }}
             _showAjaxNotice(j.message || 'Revisão salva.', j.type || 'ok');
@@ -4352,6 +4749,183 @@ def _render_page(
       notice.className = 'notice ' + (type || 'ok');
       notice.textContent = message || '';
     }}
+
+	    var _signalSeen = new Set(
+	      Array.from(document.querySelectorAll('.signal-train-card[data-signal-key]'))
+	        .map(function(card) {{ return card.getAttribute('data-signal-key') || ''; }})
+	        .filter(Boolean)
+	    );
+	    var _signalInFlight = new Set();
+	    var _signalNextInFlight = false;
+	    var _signalNextQueued = false;
+
+	    function _currentSignalFilter() {{
+	      try {{
+	        return new URL(location.href).searchParams.get('signal_type') || 'all';
+	      }} catch (e) {{
+	        return 'all';
+	      }}
+	    }}
+
+	    function _bumpSignalCount(id, delta) {{
+	      var el = document.getElementById(id);
+	      if (!el) return;
+	      var n = parseInt(el.textContent || '0', 10);
+	      if (Number.isNaN(n)) return;
+	      el.textContent = String(Math.max(0, n + delta));
+	    }}
+
+	    function _signalCardsForKey(key, fallbackCard) {{
+	      var cards = Array.from(document.querySelectorAll('.signal-train-card[data-signal-key]'))
+	        .filter(function(card) {{ return card.getAttribute('data-signal-key') === key; }});
+	      if (!cards.length && fallbackCard) cards = [fallbackCard];
+	      return cards;
+	    }}
+
+	    function _setSignalCardsSaving(key, selectedButton, fallbackCard) {{
+	      _signalCardsForKey(key, fallbackCard).forEach(function(card) {{
+	        card.classList.remove('save-error');
+	        card.classList.add('saving');
+	        card.querySelectorAll('.signal-choice').forEach(function(other) {{
+	          other.disabled = true;
+	          other.classList.toggle('selected', other === selectedButton);
+	        }});
+	      }});
+	    }}
+
+	    function _setSignalCardsError(key, fallbackCard) {{
+	      _signalCardsForKey(key, fallbackCard).forEach(function(card) {{
+	        card.classList.remove('saving');
+	        card.classList.add('save-error');
+	        card.querySelectorAll('.signal-choice').forEach(function(other) {{
+	          other.disabled = false;
+	        }});
+	      }});
+	    }}
+
+	    function _signalAppendNext() {{
+	      var grid = document.querySelector('.signal-train-grid');
+	      if (!grid) return;
+	      if (_signalNextInFlight) {{
+	        _signalNextQueued = true;
+	        return;
+	      }}
+	      _signalNextInFlight = true;
+	      var params = new URLSearchParams();
+	      params.set('signal_type', _currentSignalFilter());
+	      Array.from(_signalSeen).forEach(function(key) {{
+	        params.append('shown', key);
+	      }});
+	      fetch('/signal-train-next?' + params.toString())
+	        .then(function(r) {{ return r.text(); }})
+	        .then(function(html) {{
+	          var trimmed = html.trim();
+	          if (!trimmed) return;
+	          var div = document.createElement('div');
+	          div.innerHTML = trimmed;
+	          var card = div.firstElementChild;
+	          if (!card) return;
+	          var key = card.getAttribute('data-signal-key') || '';
+	          if (key) _signalSeen.add(key);
+	          card.style.opacity = '0';
+	          card.style.transform = 'translateY(6px)';
+	          grid.appendChild(card);
+	          _bindSignalTrain(card);
+	          requestAnimationFrame(function() {{
+	            card.style.transition = 'opacity .2s, transform .2s';
+	            card.style.opacity = '1';
+	            card.style.transform = 'translateY(0)';
+	          }});
+	        }})
+	        .catch(function() {{}})
+	        .finally(function() {{
+	          _signalNextInFlight = false;
+	          if (_signalNextQueued) {{
+	            _signalNextQueued = false;
+	            _signalAppendNext();
+	          }}
+	        }});
+	    }}
+
+	    function _removeSignalCardsByKey(key, fallbackCard) {{
+	      var cards = _signalCardsForKey(key, fallbackCard);
+	      cards = cards.filter(function(card) {{
+	        if (!card || card.dataset.signalRemoving === '1') return false;
+	        card.dataset.signalRemoving = '1';
+	        return true;
+	      }});
+	      if (!cards.length) {{
+	        _signalAppendNext();
+	        return;
+	      }}
+	      var pending = cards.length;
+	      function done() {{
+	        pending -= 1;
+	        if (pending <= 0) {{
+	          _bumpSignalCount('signal-candidate-total', -1);
+	          _signalAppendNext();
+	        }}
+	      }}
+	      cards.forEach(function(card) {{
+	        card.style.transition = 'opacity .18s, transform .18s';
+	        card.style.opacity = '0';
+	        card.style.transform = 'translateY(-6px)';
+	        setTimeout(function() {{
+	          card.remove();
+	          done();
+	        }}, 190);
+	      }});
+	    }}
+
+	    function _bindSignalTrain(root) {{
+	      (root || document).querySelectorAll('.signal-choice').forEach(function(btn) {{
+	        if (btn.dataset.signalBound === '1') return;
+	        btn.dataset.signalBound = '1';
+	        btn.addEventListener('click', function() {{
+	          var actions = btn.closest('.signal-train-actions');
+	          var card = btn.closest('.signal-train-card');
+	          if (!actions || !card) return;
+	          var key = card.getAttribute('data-signal-key') || '';
+	          if (!key || _signalInFlight.has(key)) return;
+	          _signalInFlight.add(key);
+	          _setSignalCardsSaving(key, btn, card);
+
+	          var params = new URLSearchParams();
+	          params.set('ajax', '1');
+	          params.set('signal_type', actions.dataset.signalType || '');
+	          params.set('signal_value', actions.dataset.signalValue || '');
+	          params.set('polarity', btn.dataset.polarity || '');
+	          params.set('signal_filter', _currentSignalFilter());
+	          params.set('occurrences', actions.dataset.occurrences || '');
+	          params.set('likes', actions.dataset.likes || '');
+	          params.set('dislikes', actions.dataset.dislikes || '');
+
+	          fetch('/signal-train-save', {{
+	            method: 'POST',
+	            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+	            body: params.toString()
+	          }})
+	          .then(function(r) {{
+	            return r.json().then(function(j) {{
+	              if (!r.ok || !j.ok) throw new Error(j.message || 'Falha ao salvar sinal.');
+	              return j;
+	            }});
+	          }})
+	          .then(function(j) {{
+	            _signalInFlight.delete(key);
+	            _bumpSignalCount('signal-feedback-total', 1);
+	            _showAjaxNotice(j.message || 'Sinal salvo.', j.type || 'ok');
+	            _removeSignalCardsByKey(key, card);
+	          }})
+	          .catch(function(err) {{
+	            _signalInFlight.delete(key);
+	            _setSignalCardsError(key, card);
+	            _showAjaxNotice(err.message || 'Erro ao salvar sinal.', 'err');
+	          }});
+	        }});
+	      }});
+	    }}
+	    _bindSignalTrain(document);
 
     var _lastRetrainRunning = (function() {{
       var el = document.getElementById('retrain-status');
@@ -4536,13 +5110,18 @@ def _render_page(
     }}
 
     function _appendNextReviewCard() {{
+      if (_nextReviewInFlight || _reviewNextExhausted) return;
+      _nextReviewInFlight = true;
       var u = new URL(location.href);
       var sort = u.searchParams.get('sort') || 'priority';
       fetch('/review-next?sort=' + encodeURIComponent(sort) + '&shown=' + encodeURIComponent(Array.from(_reviewSeen).join(',')))
         .then(function(r) {{ return r.text(); }})
         .then(function(html) {{
           var trimmed = html.trim();
-          if (!trimmed) return;
+          if (!trimmed) {{
+            _reviewNextExhausted = true;
+            return;
+          }}
           var tmp = document.createElement('div');
           tmp.innerHTML = trimmed;
           var card = tmp.firstElementChild;
@@ -4558,7 +5137,22 @@ def _render_page(
             document.getElementById('tab-main')?.appendChild(card);
           }}
           _initReviewCard(card);
+        }})
+        .catch(function() {{
+          _reviewNextExhausted = true;
+          _showAjaxNotice('Não consegui carregar o próximo perfil agora.', 'err');
+        }})
+        .finally(function() {{
+          _nextReviewInFlight = false;
+          if (!_reviewNextExhausted && _visibleReviewCardCount() < _reviewPageLimit) {{
+            _appendNextReviewCard();
+          }}
         }});
+    }}
+
+    function _fillReviewSlots() {{
+      if (_reviewNextExhausted || _visibleReviewCardCount() >= _reviewPageLimit) return;
+      _appendNextReviewCard();
     }}
 
     function _initReviewCard(root) {{
@@ -4895,6 +5489,11 @@ def _render_settings_page(message: str = "", msg_type: str = "") -> bytes:
 # HTTP Handler
 # ──────────────────────────────────────────────────────────────────────────────
 
+class ReviewHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
+
+
 class ReviewHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         logger.info("Review UI: " + fmt, *args)
@@ -4919,6 +5518,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("Cliente fechou a conexão antes do envio JSON da Review UI")
+
+    def _send_bytes(self, data: bytes, content_type: str, status: int = 200) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("Cliente fechou a conexão antes do envio de bytes da Review UI")
 
     def _redirect(
         self,
@@ -4947,6 +5556,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8")
         parsed = urllib.parse.parse_qs(raw)
         return parsed
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length).decode("utf-8")
+        if not raw.strip():
+            return {}
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
 
     def _form_one(self, form: dict, key: str) -> str:
         vals = form.get(key, [])
@@ -5002,7 +5619,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/":
             tab = (qs.get("tab", [""])[0] or "").strip().lower()
-            if tab not in ("photo-deep", "body-train"):
+            if tab not in ("photo-deep", "body-train", "signal-train"):
                 tab = ""
             initial_tab = tab
             selected = qs.get("selected", [""])[0]
@@ -5012,9 +5629,26 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 bt_page = max(0, int(qs.get("bt_page", ["0"])[0]))
             except Exception:
                 bt_page = 0
+            signal_type = (qs.get("signal_type", ["all"])[0] or "all").strip().lower()
+            if signal_type not in ("all", "interest", "bio", "descriptor"):
+                signal_type = "all"
+            try:
+                signal_page = max(0, int(qs.get("signal_page", ["0"])[0]))
+            except Exception:
+                signal_page = 0
             if selected and not is_allowed_photo_rel(selected):
                 selected = ""
-            self._send_html(_render_page(msg, mt, initial_tab=initial_tab, selected_photo=selected, show_all=show_all, sort_mode=sort_mode, bt_page=bt_page))
+            self._send_html(_render_page(
+                msg,
+                mt,
+                initial_tab=initial_tab,
+                selected_photo=selected,
+                show_all=show_all,
+                sort_mode=sort_mode,
+                bt_page=bt_page,
+                signal_type=signal_type,
+                signal_page=signal_page,
+            ))
             return
 
         if parsed.path == "/settings":
@@ -5060,11 +5694,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 return
             content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
             data = path.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self._send_bytes(data, content_type)
             return
 
         if parsed.path == "/body-train-next":
@@ -5077,18 +5707,79 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 if bt_id not in shown:
                     card_html = _render_bt_card(row, page=0)
                     break
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
             data = card_html.encode("utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self._send_bytes(data, "text/html; charset=utf-8")
+            return
+
+        if parsed.path == "/signal-train-next":
+            signal_type = (qs.get("signal_type", ["all"])[0] or "all").strip().lower()
+            if signal_type not in ("all", "interest", "bio", "descriptor"):
+                signal_type = "all"
+            shown = _parse_signal_shown_keys(qs.get("shown", []))
+            card_html = ""
+            for item in signal_training_candidates(signal_type, limit=600):
+                key = _signal_train_key(item)
+                if key not in shown:
+                    card_html = _render_signal_train_card(item, signal_type, page=0)
+                    break
+            self._send_html(card_html.encode("utf-8"))
             return
 
         self.send_error(404)
 
     def do_POST(self) -> None:
+        if self.path == "/signal-train-batch":
+            try:
+                payload = self._read_json()
+                items = payload.get("items") if isinstance(payload, dict) else []
+                if not isinstance(items, list):
+                    items = []
+                result = append_signal_feedback_batch(items)
+                saved = int(result.get("saved", 0) or 0)
+                errors = result.get("errors") or []
+                msg = f"{saved} sinal(is) salvo(s) no SQLite em um lote."
+                if errors:
+                    msg += f" Ignorados: {len(errors)}."
+                self._send_json({"ok": saved > 0, "message": msg, **result}, status=200 if saved > 0 else 400)
+            except Exception as exc:
+                logger.exception("Falha ao salvar lote de treino de sinais")
+                self._send_json({"ok": False, "message": f"Falha ao salvar lote: {exc}"}, status=400)
+            return
+
         form = self._read_form()
+
+        if self.path == "/signal-train-save":
+            ajax = self._form_one(form, "ajax") == "1"
+            signal_type = self._form_one(form, "signal_type").strip().lower()
+            signal_value = self._form_one(form, "signal_value").strip()
+            polarity = self._form_one(form, "polarity").strip().lower()
+            signal_filter = self._form_one(form, "signal_filter").strip().lower() or "all"
+            signal_page = self._form_one(form, "signal_page").strip() or "0"
+            if signal_filter not in ("all", "interest", "bio", "descriptor"):
+                signal_filter = "all"
+            extra = {"tab": "signal-train", "signal_type": signal_filter, "signal_page": signal_page}
+            try:
+                context = {
+                    "occurrences": self._form_one(form, "occurrences"),
+                    "likes": self._form_one(form, "likes"),
+                    "dislikes": self._form_one(form, "dislikes"),
+                }
+                record = append_signal_feedback(signal_type, signal_value, polarity, context=context)
+                msg = (
+                    f"Sinal salvo: {_signal_type_label(signal_type)} · "
+                    f"{signal_value[:80]} · {_SIGNAL_POLARITY_LABELS.get(polarity, polarity)}."
+                )
+                if ajax:
+                    self._send_json({"ok": True, "message": msg, "type": "ok", "record": record})
+                    return
+                self._redirect(msg, "ok", extra_params=extra)
+            except Exception as exc:
+                logger.exception("Falha ao salvar treino de sinal")
+                if ajax:
+                    self._send_json({"ok": False, "message": f"Falha ao salvar sinal: {exc}", "type": "err"}, status=400)
+                    return
+                self._redirect(f"Falha ao salvar sinal: {exc}", "err", extra_params=extra)
+            return
 
         if self.path == "/apply":
             ajax = self._form_one(form, "ajax") == "1"
@@ -5218,6 +5909,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 feedback_secondary=",".join(secondary),
                 feedback_details=feedback_details,
             )
+            if ok:
+                _maybe_start_review_auto_retrain("apply_review")
             msg = "Revisão salva no treino." if ok else "Revisão não encontrada."
             if ok and veto_summary:
                 msg += " Correções salvas: " + veto_summary[:180]
@@ -5344,6 +6037,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if str(original_decision).strip().upper() in {"SUPER_LIKE", "SUPER LIKE"}:
                 details["target_action"] = "super_like"
             details.update(signal_veto_details)
+            inferred_domains = _domains_from_feedback_details(details)
+            primary_domain = inferred_domains[0] if inferred_domains else "other"
+            secondary_domains = inferred_domains[1:]
+            if inferred_domains:
+                details["primary_domain"] = primary_domain
+                details["selected_domains"] = inferred_domains
+                if secondary_domains:
+                    details["secondary_domains"] = secondary_domains
             feedback_reason = (
                 "concordou_com_super_like_ia"
                 if details.get("target_action") == "super_like"
@@ -5359,11 +6060,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
             ok = apply_review(
                 review_id=review_id,
                 final_decision=original_decision,
-                feedback_domain="other",
+                feedback_domain=primary_domain,
                 feedback_reason=feedback_reason,
                 feedback_intensity="1",
+                feedback_secondary=",".join(secondary_domains),
                 feedback_details=json.dumps(details, ensure_ascii=False, sort_keys=True),
             )
+            if ok:
+                _maybe_start_review_auto_retrain("agree_review")
             msg = "Concordância com IA salva." if ok else "Revisão não encontrada."
             if ok and veto_summary:
                 msg += " Correções salvas: " + veto_summary[:180]
@@ -5489,10 +6193,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             redirect_params: dict[str, str] = {"tab": "body-train", "bt_page": bt_page_raw}
 
             def _ajax_err(msg: str):
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": False, "msg": msg}).encode())
+                self._send_json({"ok": False, "msg": msg}, status=400)
 
             if correction not in ("estreita", "media_estreita", "media", "media_ampla", "ampla", "skip", "no_body"):
                 if is_ajax: _ajax_err("Correção inválida."); return
@@ -5531,6 +6232,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 if details.get("body_build_correction"):
                     continue
                 details["body_build_correction"] = correction
+                inferred_domains = _domains_from_feedback_details(details)
+                if inferred_domains and row.get("feedback_domain", "").strip().lower() in {"", "other"}:
+                    row["feedback_domain"] = inferred_domains[0]
+                    row["feedback_secondary"] = ",".join(inferred_domains[1:])
+                    reason = row.get("feedback_reason", "").strip()
+                    if not reason or reason in {"concordou_com_ia", "concordou_com_super_like_ia", "other"}:
+                        row["feedback_reason"] = f"{reason or 'concordou_com_ia'}; correcao_corpo: {correction}"
+                    details["primary_domain"] = inferred_domains[0]
+                    details["selected_domains"] = inferred_domains
+                    if inferred_domains[1:]:
+                        details["secondary_domains"] = inferred_domains[1:]
                 row["feedback_details"] = json.dumps(details, ensure_ascii=False)
                 updated += 1
 
@@ -5543,10 +6255,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 logger.info("body-train-save: %s → %s (%d linhas)", bt_name, correction, updated)
 
             if is_ajax:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": True}).encode())
+                self._send_json({"ok": True})
                 return
 
             if correction == "skip":
@@ -5569,7 +6278,7 @@ def main() -> None:
     setup_logging()
     REVIEW_PATH.parent.mkdir(parents=True, exist_ok=True)
     hidden_filters, hidden_duplicates = _cleanup_review_queue_once()
-    server = HTTPServer(("localhost", PORT), ReviewHandler)
+    server = ReviewHTTPServer(("localhost", PORT), ReviewHandler)
     print("\n  Tinder-IA — Revisão pós-swipe")
     print("  --------------------------------------------")
     if hidden_filters:

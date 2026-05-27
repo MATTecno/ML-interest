@@ -1,5 +1,6 @@
 import csv
 import json
+import queue
 import sys
 import tempfile
 import unittest
@@ -17,7 +18,9 @@ import review_queue
 import review_ui
 import state
 import model_training
+import enqueue_quick_agree_rechecks
 import photo_semantic_embeddings
+import text_preferences
 from decision_policy import apply_decision_policy
 from features import (
     BODY_PREFERENCE_FEATURE_NAMES,
@@ -28,7 +31,13 @@ from features import (
     extract_features,
 )
 from model_evaluation import optimize_like_threshold
-from predictor import _apply_race_affinity, _gender_compatibility_filter
+from predictor import (
+    _apply_race_affinity,
+    _combined_decision_score,
+    _gender_compatibility_filter,
+    _photo_score,
+    _text_as_plus_score,
+)
 from profile_parser import extract_descriptors, parse_profile
 from resource_guard import is_memory_pressure, memory_pressure_photo_features
 from review_ui import _body_measurement_strength
@@ -86,6 +95,55 @@ class AlgorithmImprovementTests(unittest.TestCase):
             },
         )
         self.assertTrue(gender["forced_pass"])
+
+    def test_text_is_plus_only_without_explicit_negative_signal(self):
+        self.assertEqual(_text_as_plus_score(0.22, {}, {}), 0.5)
+        self.assertLess(
+            _text_as_plus_score(0.22, {"bio_negative_kw": 1}, {}),
+            0.5,
+        )
+
+    def test_configured_decision_score_keeps_photo_as_anchor(self):
+        score, photo_weight, text_weight = _combined_decision_score(
+            photo_score=0.82,
+            text_score=0.5,
+            config={"model": {"photo_weight": 0.85, "text_weight": 0.15, "meta_weight": 0.0}},
+            meta_prob=0.20,
+        )
+
+        self.assertEqual(round(photo_weight, 2), 0.85)
+        self.assertEqual(round(text_weight, 2), 0.15)
+        self.assertGreater(score, 0.75)
+
+    def test_photo_model_cannot_drag_favorable_face_too_low(self):
+        class LowPhotoPipeline:
+            def predict_proba(self, _x):
+                return [[0.9, 0.10]]
+
+        features = {name: 0.0 for name in MODEL_PHOTO_FEATURE_NAMES + SEMANTIC_EMBEDDING_FEATURE_NAMES}
+        features.update({
+            "photo_has_face": 1.0,
+            "photo_face_similarity": 0.75,
+            "photo_faces_ratio": 1.0,
+            "photo_woman_confidence": 0.95,
+            "photo_body_signal_quality": 0.70,
+            "photo_body_visible": 0.70,
+            "photo_image_sharpness": 0.80,
+            "photo_image_brightness": 0.70,
+            "photo_image_contrast": 0.70,
+            "photo_image_colorfulness": 0.70,
+        })
+
+        score, components, mode, raw_prob = _photo_score(
+            features,
+            {"photo_pipeline": LowPhotoPipeline(), "photo_feature_names": MODEL_PHOTO_FEATURE_NAMES + SEMANTIC_EMBEDDING_FEATURE_NAMES},
+            {"model": {"photo_supervised_weight": 0.35, "photo_model_max_drag_from_heuristic": 0.12}},
+        )
+
+        self.assertEqual(mode, "supervisionado")
+        self.assertEqual(raw_prob, 0.10)
+        self.assertGreaterEqual(score, 0.60)
+        self.assertEqual(components["photo_score_floor"], "piso por rosto favorável")
 
     def test_threshold_optimizer_prefers_recall_with_precision_floor(self):
         y = [1, 1, 1, 1, 0, 0, 0, 0]
@@ -486,6 +544,232 @@ class AlgorithmImprovementTests(unittest.TestCase):
                 review_queue.ROOT_DIR = old_root
                 review_queue.PHOTOS_DIR = old_photos_dir
 
+    def test_quick_agree_recheck_survives_normal_review_dedupe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profiles = root / "data" / "profiles.csv"
+            review_path = root / "data" / "review_queue.csv"
+            photo_rel = "data/photos/liked/abc_Julia_22.jpg"
+            (root / photo_rel).parent.mkdir(parents=True)
+            (root / photo_rel).write_bytes(b"photo")
+            profiles.parent.mkdir(parents=True, exist_ok=True)
+            row = {key: "" for key in dataset.CSV_FIELDNAMES}
+            row.update({
+                "name": "Julia",
+                "age": "22",
+                "label": "1",
+                "source": "real",
+                "final_decision": "CURTIR",
+            })
+            with profiles.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=dataset.CSV_FIELDNAMES)
+                writer.writeheader()
+                writer.writerow(row)
+
+            normal_review = {key: "" for key in review_queue.REVIEW_FIELDNAMES}
+            normal_review.update({
+                "review_id": "normal-review",
+                "created_at": "2026-05-13T09:00:00",
+                "review_status": "reviewed",
+                "photo_path": photo_rel,
+                "review_mode": "auto",
+                "name": "Julia",
+                "age": "22",
+                "label": "1",
+                "source": "auto_review",
+            })
+            recheck = review_queue._history_review_row(
+                row,
+                0,
+                dataset.profile_row_signature(row),
+                photo_rel,
+                10,
+            )
+            recheck["review_mode"] = "quick_agree_recheck"
+            with review_path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=review_queue.REVIEW_FIELDNAMES)
+                writer.writeheader()
+                writer.writerow(normal_review)
+                writer.writerow({key: recheck.get(key, "") for key in review_queue.REVIEW_FIELDNAMES})
+
+            old_review_path = review_queue.REVIEW_PATH
+            old_review_profiles_path = review_queue.PROFILES_PATH
+            old_dataset_profiles_path = dataset.PROFILES_PATH
+            old_root = review_queue.ROOT_DIR
+            old_photos_dir = review_queue.PHOTOS_DIR
+            try:
+                review_queue.REVIEW_PATH = review_path
+                review_queue.PROFILES_PATH = profiles
+                dataset.PROFILES_PATH = profiles
+                review_queue.ROOT_DIR = root
+                review_queue.PHOTOS_DIR = root / "data" / "photos"
+
+                self.assertEqual(review_queue.skip_duplicate_history_reviews(), 0)
+                with review_path.open(encoding="utf-8") as f:
+                    rows = list(csv.DictReader(f))
+                self.assertEqual(rows[1]["review_status"], "pending")
+            finally:
+                review_queue.REVIEW_PATH = old_review_path
+                review_queue.PROFILES_PATH = old_review_profiles_path
+                dataset.PROFILES_PATH = old_dataset_profiles_path
+                review_queue.ROOT_DIR = old_root
+                review_queue.PHOTOS_DIR = old_photos_dir
+
+    def test_enqueue_quick_agree_recheck_includes_plain_rows_without_photo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profiles = root / "data" / "profiles.csv"
+            review_path = root / "data" / "review_queue.csv"
+            profiles.parent.mkdir(parents=True, exist_ok=True)
+            with profiles.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=dataset.CSV_FIELDNAMES)
+                writer.writeheader()
+                row = {key: "" for key in dataset.CSV_FIELDNAMES}
+                row.update({
+                    "name": "Julia",
+                    "age": "22",
+                    "label": "1",
+                    "source": "real",
+                    "final_decision": "CURTIR",
+                    "feedback_domain": "other",
+                    "feedback_details": json.dumps({"quick_agree": True}),
+                })
+                writer.writerow(row)
+
+            old_script_profiles = enqueue_quick_agree_rechecks.PROFILES_PATH
+            old_script_review = enqueue_quick_agree_rechecks.REVIEW_PATH
+            old_review_root = review_queue.ROOT_DIR
+            old_review_photos = review_queue.PHOTOS_DIR
+            try:
+                enqueue_quick_agree_rechecks.PROFILES_PATH = profiles
+                enqueue_quick_agree_rechecks.REVIEW_PATH = review_path
+                review_queue.ROOT_DIR = root
+                review_queue.PHOTOS_DIR = root / "data" / "photos"
+
+                skipped = enqueue_quick_agree_rechecks.enqueue(include_no_photo=False)
+                self.assertEqual(skipped["would_enqueue"], 0)
+                self.assertEqual(skipped["skipped_no_photo"], 1)
+
+                result = enqueue_quick_agree_rechecks.enqueue(apply=True, include_no_photo=True)
+                self.assertEqual(result["enqueued"], 1)
+                with review_path.open(encoding="utf-8") as f:
+                    rows = list(csv.DictReader(f))
+                self.assertEqual(rows[0]["review_mode"], "quick_agree_recheck")
+                self.assertEqual(rows[0]["review_status"], "pending")
+                self.assertEqual(rows[0]["photo_path"], "")
+            finally:
+                enqueue_quick_agree_rechecks.PROFILES_PATH = old_script_profiles
+                enqueue_quick_agree_rechecks.REVIEW_PATH = old_script_review
+                review_queue.ROOT_DIR = old_review_root
+                review_queue.PHOTOS_DIR = old_review_photos
+
+    def test_text_signal_feedback_neutralizes_interest_without_relabeling_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profiles = Path(tmp) / "profiles.csv"
+            signals = Path(tmp) / "text_signal_feedback.jsonl"
+            signal_db = Path(tmp) / "text_signal_feedback.sqlite"
+            profiles.write_text(
+                "name,age,label,source,bio,interests,descriptors,feedback_domain,feedback_details\n"
+                "Julia,22,1,real,,Sertanejo,{},interests,\"{\"\"selected_interests\"\": [\"\"Sertanejo\"\"]}\"\n",
+                encoding="utf-8",
+            )
+
+            old_profiles = text_preferences.PROFILES_PATH
+            old_signals = text_preferences.TEXT_SIGNAL_FEEDBACK_PATH
+            old_signal_db = text_preferences.TEXT_SIGNAL_FEEDBACK_DB_PATH
+            try:
+                text_preferences.PROFILES_PATH = profiles
+                text_preferences.TEXT_SIGNAL_FEEDBACK_PATH = signals
+                text_preferences.TEXT_SIGNAL_FEEDBACK_DB_PATH = signal_db
+                text_preferences._invalidate_cache()
+
+                before = text_preferences.score_profile_text("", ["Sertanejo"], {})
+                self.assertGreater(before["interest_pref_score"], 0.5)
+
+                text_preferences.append_signal_feedback("interest", "Sertanejo", "neutral")
+                after = text_preferences.score_profile_text("", ["Sertanejo"], {})
+                self.assertEqual(after["interest_pref_score"], 0.5)
+                self.assertEqual(len(profiles.read_text(encoding="utf-8").splitlines()), 2)
+                self.assertTrue(signal_db.exists())
+            finally:
+                text_preferences.PROFILES_PATH = old_profiles
+                text_preferences.TEXT_SIGNAL_FEEDBACK_PATH = old_signals
+                text_preferences.TEXT_SIGNAL_FEEDBACK_DB_PATH = old_signal_db
+                text_preferences._invalidate_cache()
+
+    def test_signal_training_candidates_use_bio_phrases_not_generic_words(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profiles = Path(tmp) / "profiles.csv"
+            signals = Path(tmp) / "text_signal_feedback.jsonl"
+            signal_db = Path(tmp) / "text_signal_feedback.sqlite"
+            profiles.write_text(
+                "name,age,label,source,bio,interests,descriptors,feedback_domain,feedback_details\n"
+                "A,22,1,real,tenho filhos e tenho anos,,{},,\n"
+                "B,23,0,real,tenho filhos e tenho anos,,{},,\n",
+                encoding="utf-8",
+            )
+
+            old_profiles = text_preferences.PROFILES_PATH
+            old_signals = text_preferences.TEXT_SIGNAL_FEEDBACK_PATH
+            old_signal_db = text_preferences.TEXT_SIGNAL_FEEDBACK_DB_PATH
+            try:
+                text_preferences.PROFILES_PATH = profiles
+                text_preferences.TEXT_SIGNAL_FEEDBACK_PATH = signals
+                text_preferences.TEXT_SIGNAL_FEEDBACK_DB_PATH = signal_db
+                text_preferences._invalidate_cache()
+
+                values = {
+                    item["signal_value"]
+                    for item in text_preferences.signal_training_candidates("bio", limit=20, min_occurrences=1)
+                }
+                self.assertIn("tenho filhos", values)
+                self.assertNotIn("tenho", values)
+                self.assertNotIn("tenho anos", values)
+            finally:
+                text_preferences.PROFILES_PATH = old_profiles
+                text_preferences.TEXT_SIGNAL_FEEDBACK_PATH = old_signals
+                text_preferences.TEXT_SIGNAL_FEEDBACK_DB_PATH = old_signal_db
+                text_preferences._invalidate_cache()
+
+    def test_text_signal_feedback_batch_saves_single_sqlite_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profiles = Path(tmp) / "profiles.csv"
+            signals = Path(tmp) / "text_signal_feedback.jsonl"
+            signal_db = Path(tmp) / "text_signal_feedback.sqlite"
+            profiles.write_text(
+                "name,age,label,source,bio,interests,descriptors,feedback_domain,feedback_details\n"
+                "Julia,22,1,real,,Sertanejo,{},interests,\"{\"\"selected_interests\"\": [\"\"Sertanejo\"\"]}\"\n",
+                encoding="utf-8",
+            )
+
+            old_profiles = text_preferences.PROFILES_PATH
+            old_signals = text_preferences.TEXT_SIGNAL_FEEDBACK_PATH
+            old_signal_db = text_preferences.TEXT_SIGNAL_FEEDBACK_DB_PATH
+            try:
+                text_preferences.PROFILES_PATH = profiles
+                text_preferences.TEXT_SIGNAL_FEEDBACK_PATH = signals
+                text_preferences.TEXT_SIGNAL_FEEDBACK_DB_PATH = signal_db
+                text_preferences._invalidate_cache()
+
+                result = text_preferences.append_signal_feedback_batch([
+                    {"signal_type": "interest", "signal_value": "Sertanejo", "polarity": "neutral"},
+                    {"signal_type": "descriptor", "signal_value": "Família: Não quero filhos", "polarity": "negative"},
+                    {"signal_type": "bad", "signal_value": "x", "polarity": "positive"},
+                ])
+
+                self.assertEqual(result["saved"], 2)
+                self.assertEqual(len(result["errors"]), 1)
+                counts = text_preferences.signal_feedback_counts()
+                self.assertEqual(counts[("interest", "sertanejo")]["neutral"], 1)
+                self.assertEqual(counts[("descriptor", "familia: nao quero filhos")]["negative"], 1)
+                self.assertFalse(signals.exists())
+                self.assertTrue(signal_db.exists())
+            finally:
+                text_preferences.PROFILES_PATH = old_profiles
+                text_preferences.TEXT_SIGNAL_FEEDBACK_PATH = old_signals
+                text_preferences.TEXT_SIGNAL_FEEDBACK_DB_PATH = old_signal_db
+                text_preferences._invalidate_cache()
+
     def test_body_photo_review_dedupes_same_profile_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -797,6 +1081,18 @@ class AlgorithmImprovementTests(unittest.TestCase):
         self.assertLess(age, 10)
         self.assertFalse(balance["available"])
 
+    def test_current_profile_ignores_short_same_name_age_flipflop(self):
+        state.clear_active_profiles()
+        try:
+            state.set_current("Ana", "id-a", 23)
+            state.set_current("Ana", "id-b", 23)
+            state.set_current("Ana", "id-a", 23)
+
+            _, current_id, _, _ = state.get_current_meta()
+            self.assertEqual(current_id, "id-b")
+        finally:
+            state.clear_active_profiles()
+
     def test_pass_correction_gets_extra_training_weight(self):
         import pandas as pd
 
@@ -804,18 +1100,18 @@ class AlgorithmImprovementTests(unittest.TestCase):
             {
                 "source": "real",
                 "feedback_domain": "photo",
-                "feedback_intensity": "2",
-                "manual_corrected": "1",
-                "label": "0",
+                "feedback_intensity": 2.0,
+                "manual_corrected": 1.0,
+                "label": 0.0,
                 "ai_decision": "CURTIR",
                 "feedback_details": "{}",
             },
             {
                 "source": "real",
                 "feedback_domain": "photo",
-                "feedback_intensity": "2",
-                "manual_corrected": "1",
-                "label": "1",
+                "feedback_intensity": 2.0,
+                "manual_corrected": 1.0,
+                "label": 1.0,
                 "ai_decision": "NÃO CURTIR",
                 "feedback_details": "{}",
             },
@@ -834,6 +1130,47 @@ class AlgorithmImprovementTests(unittest.TestCase):
         weights = model_training._sample_weights(df, "photo", cfg)
 
         self.assertGreater(weights[0], weights[1])
+
+    def test_feedback_weight_normalizes_float_tokens_from_csv(self):
+        import pandas as pd
+
+        df = pd.DataFrame([
+            {
+                "source": "real",
+                "feedback_domain": "photo",
+                "feedback_intensity": 3.0,
+                "manual_corrected": 1.0,
+                "label": 0.0,
+                "ai_decision": "CURTIR",
+                "feedback_details": "{}",
+            }
+        ])
+        cfg = {
+            "model": {
+                "feedback_weights": {
+                    "enabled": True,
+                    "manual_correction_multiplier": 1.5,
+                    "pass_correction_multiplier": 2.0,
+                    "max_sample_weight": 100,
+                    "intensity_multipliers": {"3": 2.0},
+                    "photo_model": {"photo": 2.0},
+                }
+            }
+        }
+
+        weights = model_training._sample_weights(df, "photo", cfg)
+
+        self.assertEqual(weights[0], 12.0)
+
+    def test_quick_agree_domain_infers_structured_feedback(self):
+        details = {
+            "quick_agree": True,
+            "interest_not_negative": ["Experimentar coisas novas"],
+            "descriptor_not_negative": ["Família: Ainda não sei"],
+        }
+
+        self.assertEqual(review_ui._primary_domain_from_details(details), "descriptors")
+        self.assertEqual(review_ui._domains_from_feedback_details(details), ["descriptors", "interests"])
 
     def test_photo_deep_feedback_gets_visual_training_weight(self):
         import pandas as pd
@@ -901,6 +1238,58 @@ class AlgorithmImprovementTests(unittest.TestCase):
                 photo_semantic_embeddings.get_photos_config = old_config
                 photo_semantic_embeddings._CACHE_DATA = old_cache
 
+    def test_semantic_embedding_sqlite_migrates_legacy_json_and_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import sqlite3
+
+            legacy_path = Path(tmp) / "semantic_cache.json"
+            sqlite_path = Path(tmp) / "semantic_cache.sqlite"
+            key = "url:/u/test/sqlite.webp"
+            legacy_path.write_text(
+                json.dumps({
+                    key: {
+                        "model_name": "test-clip-sqlite",
+                        "embedding": [0.25] * 512,
+                        "device": "cpu",
+                    }
+                }),
+                encoding="utf-8",
+            )
+
+            old_config = photo_semantic_embeddings.get_photos_config
+            old_cache = photo_semantic_embeddings._CACHE_DATA
+            old_signatures = set(photo_semantic_embeddings._SQLITE_IMPORT_SIGNATURES)
+            try:
+                photo_semantic_embeddings._CACHE_DATA = None
+                photo_semantic_embeddings._SQLITE_IMPORT_SIGNATURES.clear()
+                photo_semantic_embeddings.get_photos_config = lambda: {
+                    "semantic_embedding": {
+                        "enabled": True,
+                        "model_name": "test-clip-sqlite",
+                        "cache_backend": "sqlite",
+                        "cache_path": str(sqlite_path),
+                        "legacy_json_cache_path": str(legacy_path),
+                    }
+                }
+
+                result = photo_semantic_embeddings.migrate_legacy_json_to_sqlite(force=True)
+                emb = photo_semantic_embeddings.get_cached_embedding(key)
+                loaded = photo_semantic_embeddings.load_embeddings_from_cache()
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["imported"], 1)
+                self.assertIsNotNone(emb)
+                self.assertEqual(int(emb.shape[0]), 512)
+                self.assertEqual(len(loaded), 1)
+                with sqlite3.connect(sqlite_path) as conn:
+                    count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+                self.assertEqual(count, 1)
+            finally:
+                photo_semantic_embeddings.get_photos_config = old_config
+                photo_semantic_embeddings._CACHE_DATA = old_cache
+                photo_semantic_embeddings._SQLITE_IMPORT_SIGNATURES.clear()
+                photo_semantic_embeddings._SQLITE_IMPORT_SIGNATURES.update(old_signatures)
+
     def test_semantic_embedding_batch_for_paths_uses_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = Path(tmp) / "semantic_cache.json"
@@ -950,6 +1339,251 @@ class AlgorithmImprovementTests(unittest.TestCase):
                 photo_semantic_embeddings.get_photos_config = old_config
                 photo_semantic_embeddings._CACHE_DATA = old_cache
                 photo_semantic_embeddings._get_model = old_get_model
+
+    def test_semantic_embedding_bgr_worker_uses_cache_and_saves_misses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import numpy as np
+            import photo_semantic_worker
+
+            cache_path = Path(tmp) / "semantic_cache.json"
+            key_hit = "url:/hit.webp"
+            key_miss = "url:/miss.webp"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        key_hit: {
+                            "model_name": "test-clip-worker",
+                            "embedding": [1.0] * 16,
+                            "device": "cuda",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            calls = []
+
+            def fake_encode_rgb_batch(images, model_name, device, batch_size, start_timeout, request_timeout):
+                calls.append(
+                    {
+                        "labels": [item["label"] for item in images],
+                        "model_name": model_name,
+                        "device": device,
+                        "batch_size": batch_size,
+                        "start_timeout": start_timeout,
+                        "request_timeout": request_timeout,
+                    }
+                )
+                return {
+                    "ok": True,
+                    "device": "cuda",
+                    "embeddings": {item["label"]: [2.0] * 16 for item in images},
+                    "errors": {},
+                }
+
+            old_config = photo_semantic_embeddings.get_photos_config
+            old_cache = photo_semantic_embeddings._CACHE_DATA
+            old_encode = photo_semantic_worker.encode_rgb_batch
+            try:
+                photo_semantic_embeddings._CACHE_DATA = None
+                photo_semantic_embeddings.get_photos_config = lambda: {
+                    "semantic_embedding": {
+                        "enabled": True,
+                        "worker_enabled": True,
+                        "model_name": "test-clip-worker",
+                        "cache_path": str(cache_path),
+                        "batch_size": 2,
+                        "worker_start_timeout_seconds": 3,
+                        "worker_request_timeout_seconds": 4,
+                    }
+                }
+                photo_semantic_worker.encode_rgb_batch = fake_encode_rgb_batch
+
+                img = np.zeros((4, 4, 3), dtype=np.uint8)
+                first = photo_semantic_embeddings.embeddings_for_bgr_sources(
+                    [
+                        ("hit", key_hit, img),
+                        ("miss", key_miss, img),
+                    ]
+                )
+
+                self.assertEqual(first["hit"].tolist(), [1.0] * 16)
+                self.assertEqual(first["miss"].tolist(), [2.0] * 16)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["labels"], ["miss"])
+                self.assertEqual(calls[0]["batch_size"], 2)
+                self.assertEqual(calls[0]["start_timeout"], 3)
+                self.assertEqual(calls[0]["request_timeout"], 4)
+
+                cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
+                self.assertIn(key_hit, cache_data)
+                self.assertIn(key_miss, cache_data)
+
+                calls.clear()
+                photo_semantic_embeddings.cache_stats(reset=True)
+                second = photo_semantic_embeddings.embeddings_for_bgr_sources(
+                    [
+                        ("hit", key_hit, img),
+                        ("miss", key_miss, img),
+                    ]
+                )
+                stats = photo_semantic_embeddings.cache_stats()
+                self.assertEqual(second["miss"].tolist(), [2.0] * 16)
+                self.assertEqual(calls, [])
+                self.assertEqual(stats["hits"], 2)
+            finally:
+                photo_semantic_embeddings.get_photos_config = old_config
+                photo_semantic_embeddings._CACHE_DATA = old_cache
+                photo_semantic_worker.encode_rgb_batch = old_encode
+
+    def test_semantic_embedding_bgr_worker_saves_miss_to_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import sqlite3
+            import numpy as np
+            import photo_semantic_worker
+
+            sqlite_path = Path(tmp) / "semantic_cache.sqlite"
+            key_miss = "url:/sqlite-miss.webp"
+
+            def fake_encode_rgb_batch(images, *_args):
+                return {
+                    "ok": True,
+                    "device": "cuda",
+                    "embeddings": {item["label"]: [3.0] * 512 for item in images},
+                    "errors": {},
+                }
+
+            old_config = photo_semantic_embeddings.get_photos_config
+            old_cache = photo_semantic_embeddings._CACHE_DATA
+            old_signatures = set(photo_semantic_embeddings._SQLITE_IMPORT_SIGNATURES)
+            old_encode = photo_semantic_worker.encode_rgb_batch
+            try:
+                photo_semantic_embeddings._CACHE_DATA = None
+                photo_semantic_embeddings._SQLITE_IMPORT_SIGNATURES.clear()
+                photo_semantic_embeddings.get_photos_config = lambda: {
+                    "semantic_embedding": {
+                        "enabled": True,
+                        "worker_enabled": True,
+                        "model_name": "test-clip-sqlite-worker",
+                        "cache_backend": "sqlite",
+                        "cache_path": str(sqlite_path),
+                        "batch_size": 1,
+                    }
+                }
+                photo_semantic_worker.encode_rgb_batch = fake_encode_rgb_batch
+
+                img = np.zeros((4, 4, 3), dtype=np.uint8)
+                result = photo_semantic_embeddings.embeddings_for_bgr_sources([("miss", key_miss, img)])
+                self.assertEqual(result["miss"].tolist(), [3.0] * 512)
+
+                with sqlite3.connect(sqlite_path) as conn:
+                    row = conn.execute(
+                        "SELECT model_name, dim FROM embeddings WHERE source_key = ?",
+                        (key_miss,),
+                    ).fetchone()
+                self.assertEqual(row, ("test-clip-sqlite-worker", 512))
+
+                photo_semantic_embeddings.cache_stats(reset=True)
+                cached = photo_semantic_embeddings.embeddings_for_bgr_sources([("miss", key_miss, img)])
+                stats = photo_semantic_embeddings.cache_stats()
+                self.assertEqual(cached["miss"].tolist(), [3.0] * 512)
+                self.assertEqual(stats["hits"], 1)
+            finally:
+                photo_semantic_embeddings.get_photos_config = old_config
+                photo_semantic_embeddings._CACHE_DATA = old_cache
+                photo_semantic_embeddings._SQLITE_IMPORT_SIGNATURES.clear()
+                photo_semantic_embeddings._SQLITE_IMPORT_SIGNATURES.update(old_signatures)
+                photo_semantic_worker.encode_rgb_batch = old_encode
+
+    def test_semantic_embedding_bgr_worker_timeout_is_nonfatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import numpy as np
+            import photo_semantic_worker
+
+            cache_path = Path(tmp) / "semantic_cache.json"
+
+            def fake_timeout(*_args, **_kwargs):
+                raise TimeoutError("fake worker timeout")
+
+            old_config = photo_semantic_embeddings.get_photos_config
+            old_cache = photo_semantic_embeddings._CACHE_DATA
+            old_encode = photo_semantic_worker.encode_rgb_batch
+            try:
+                photo_semantic_embeddings._CACHE_DATA = None
+                photo_semantic_embeddings.get_photos_config = lambda: {
+                    "semantic_embedding": {
+                        "enabled": True,
+                        "worker_enabled": True,
+                        "model_name": "test-clip-timeout",
+                        "cache_path": str(cache_path),
+                    }
+                }
+                photo_semantic_worker.encode_rgb_batch = fake_timeout
+
+                img = np.zeros((4, 4, 3), dtype=np.uint8)
+                result = photo_semantic_embeddings.embeddings_for_bgr_sources(
+                    [("miss", "url:/timeout.webp", img)]
+                )
+
+                self.assertIsNone(result["miss"])
+                self.assertFalse(cache_path.exists())
+            finally:
+                photo_semantic_embeddings.get_photos_config = old_config
+                photo_semantic_embeddings._CACHE_DATA = old_cache
+                photo_semantic_worker.encode_rgb_batch = old_encode
+
+    def test_clip_worker_client_waits_past_intermediate_empty_queue(self):
+        import photo_semantic_worker
+
+        class FakeProcess:
+            pid = 12345
+
+            def is_alive(self):
+                return True
+
+        class FakeRequestQueue:
+            def __init__(self):
+                self.payloads = []
+
+            def put(self, payload, timeout=None):
+                self.payloads.append(payload)
+
+        class FakeResponseQueue:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise queue.Empty()
+                return {
+                    "request_id": request_queue.payloads[-1]["request_id"],
+                    "ok": True,
+                    "device": "cuda",
+                    "embeddings": {"img": [1.0] * 16},
+                    "errors": {},
+                    "elapsed_seconds": 0.2,
+                }
+
+        request_queue = FakeRequestQueue()
+        response_queue = FakeResponseQueue()
+        client = photo_semantic_worker.ClipWorkerClient()
+        client._process = FakeProcess()
+        client._request_q = request_queue
+        client._response_q = response_queue
+        client._start_locked = lambda _timeout: None
+
+        response = client.encode_rgb_batch(
+            [{"label": "img", "width": 1, "height": 1, "rgb_bytes": b"\x00\x00\x00"}],
+            "test-clip",
+            "cuda",
+            1,
+            1,
+            2,
+        )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response_queue.calls, 2)
 
     def test_extract_features_includes_semantic_photo_features(self):
         profile = {

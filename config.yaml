@@ -106,6 +106,8 @@ preferences:
   - voce fuma?
   - estilo de comunicacao
   - familia
+  - signo
+  - to procurando
 swiper:
   enabled: true
   interactive_mode: false
@@ -114,32 +116,55 @@ swiper:
   stop_hotkey: f10
   reload_on_sync_failure: true
   reload_on_swipe_failure: true
-  sync_max_wait_count: 20
+  min_reload_start_interval_seconds: 45
+  sync_max_wait_count: 5
   sync_retry_sleep: 0.5
-  min_reload_interval_seconds: 90
-  max_consecutive_sync_skips: 3
-  max_pending_batches: 3
+  min_reload_interval_seconds: 999
+  max_consecutive_sync_skips: 5
+  max_pending_batches: 1
   cpu_alert_threshold_percent: 80
   mem_alert_threshold_percent: 85
-  mem_pressure_threshold_percent: 88
-  min_mem_available_mb: 1200
-  max_pending_queue: 20
+  mem_pressure_threshold_percent: 82
+  min_mem_available_mb: 2500
+  max_swap_used_percent: 95
+  max_pending_queue: 40
   drop_duplicate_profiles: true
   recent_swipe_ttl_seconds: 600
   recs_dedupe_ttl_seconds: 600
   swipe_verify_timeout_seconds: 6.0
   swipe_verify_max_attempts: 2
+  startup_warmup:
+    enabled: true
+    min_cooldown_seconds: 8
+    max_wait_seconds: 90
+    wait_before_profiles: true
+    warm_clip_worker: true
+    warm_prediction: true
+    warm_bio_embedding: true
   memory_resume:
     enabled: true
-    check_interval_seconds: 10
+    check_interval_seconds: 20
+    resume_below_percent: 78
+    resume_min_available_mb: 3500
+    max_swap_used_percent: 90
     reload_on_resume: false
+  memory_restart:
+    enabled: true
+    check_interval_seconds: 20
+    pressure_seconds: 45
+    min_interval_seconds: 3000
+    reload_after_restart: true
+    navigate_to_recs: true
+    wait_for_relief: true
+    relief_check_interval_seconds: 5
+    relief_timeout_seconds: 340
   native_fallback:
     enabled: true
     method: keyboard
-    wait_after_seconds: 0.8
+    wait_after_seconds: 3.0
   card_center:
-  - 3103
-  - 550
+  - 3101
+  - 701
   view_time_range:
   - 1.5
   - 4.0
@@ -218,6 +243,9 @@ hard_filters:
   - Descubra sigilo
   - Caio Batista
   - Andeson
+  - estevao
+  - Augusto
+  - Tchuquiha CRYZ
   photo_min_woman_confidence: 0.6
   photo_min_brightness: 0.08
 photos:
@@ -228,6 +256,11 @@ photos:
   analysis_quality: medium
   detector_backend: opencv
   detector_fallback_backend: mtcnn
+  detector_fallback_policy: first_photo_selective
+  detector_fallback_max_photo_index: 1
+  detector_fallback_min_sharpness: 0.35
+  detector_fallback_min_brightness: 0.12
+  detector_fallback_min_colorfulness: 0.08
   enable_face_embedding: true
   embedding_strategy: best_photo
   embedding_detector_backend: opencv
@@ -236,7 +269,7 @@ photos:
   max_per_folder: 2000
   allow_legacy_audit_eviction: true
   audit_retention_grace_hours: 168
-  max_analysis_photos: 3
+  max_analysis_photos: 2
   training_initial_max_photos: 4
   save_face_body_pair: true
   face_save_min_confidence: 0.5
@@ -244,7 +277,15 @@ photos:
   body_save_min_strength: 0.45
   download_timeout_seconds: 8
   analysis_timeout_seconds: 12
-  analysis_parallel_workers: 2
+  analysis_parallel_workers: 1
+  prefetch_enabled: true
+  prefetch_next_profiles: 2
+  prefetch_parallel_workers: 1
+  prefetch_wait_timeout_seconds: 2.5
+  prefetch_current_max_wait_seconds: 18
+  prefetch_avoid_direct_duplicate: true
+  prefetch_memory_soft_limit_percent: 75
+  prefetch_memory_soft_window: 1
   body_analysis:
     enabled: true
     mode: lightweight
@@ -262,13 +303,20 @@ photos:
     pca_components: 32
     timeout_seconds: 20
     batch_timeout_seconds: 60
-    batch_size: 8
-    max_photos_per_profile: 4
-    cache_path: data/photo_semantic_cache.json
+    worker_enabled: true
+    worker_start_timeout_seconds: 30
+    worker_request_timeout_seconds: 60
+    worker_idle_shutdown_seconds: 0
+    batch_size: 1
+    max_photos_per_profile: 2
+    release_after_batch: false
+    cache_backend: sqlite
+    cache_path: data/photo_semantic_cache.sqlite
+    legacy_json_cache_path: data/photo_semantic_cache.json
     cache_no_face_results: true
   reanalyze_all_if_woman_confidence_below: 0.5
-  suspicious_gender_max_photos: 4
-  uncertain_max_photos: 4
+  suspicious_gender_max_photos: 2
+  uncertain_max_photos: 2
   uncertain_probability_threshold: 0.15
 browser:
   enabled: false
@@ -284,6 +332,12 @@ browser:
     allowed_path_prefixes:
     - /app/recs
     wrong_url_cooldown_seconds: 20
+  reload_ack_watchdog:
+    enabled: true
+    check_interval_seconds: 5
+    ack_timeout_seconds: 45
+    notice_repeat_seconds: 120
+    navigate_to_recs: true
 review_ui:
   photo_deep_enabled: false
 notifications:
@@ -292,22 +346,30 @@ notifications:
   app_name: Tinder IA
   cooldown_seconds: 45
   timeout_ms: 8000
+  transient: true
+  urgency_overrides:
+    reload_not_acknowledged: normal
   events:
     resource_high: true
     memory_pressure: true
     memory_pause: true
     memory_resume: true
+    memory_restart: true
+    memory_recovered_reload: true
     memory_stop: true
     queue_cleared: true
     queue_overflow: true
+    server_auto_restart: true
     swipe_failure_reload: true
     swipe_failure_skip: true
+    sync_failure_reload: true
     modal_dismissed: true
     super_like_empty: true
     super_like_modal: true
     super_like_to_like: true
     reload_start: true
     reload_done: true
+    reload_not_acknowledged: true
     wrong_tinder_url: true
     retrain_start: true
     retrain_done: true
@@ -331,8 +393,11 @@ model:
   min_samples_for_rf: 30
   min_photo_samples_for_model: 8
   retrain_every: 10
-  photo_weight: 0.65
-  text_weight: 0.35
+  photo_weight: 0.85
+  text_weight: 0.15
+  meta_weight: 0.0
+  photo_supervised_weight: 0.35
+  photo_model_max_drag_from_heuristic: 0.12
   text_preference_weight: 0.4
   distance_adjustment_weight: 0.08
   gpu:

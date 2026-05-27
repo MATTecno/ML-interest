@@ -51,6 +51,10 @@ def notify(event: str, title: str, message: str = "", urgency: str = "normal") -
 
     app_name = str(cfg.get("app_name") or "Tinder IA").strip() or "Tinder IA"
     timeout_ms = int(float(cfg.get("timeout_ms", 8000) or 8000))
+    transient = bool(cfg.get("transient", True))
+    urgency_overrides = cfg.get("urgency_overrides", {}) or {}
+    if event and event in urgency_overrides:
+        urgency = str(urgency_overrides.get(event) or urgency)
     safe_urgency = urgency if urgency in {"low", "normal", "critical"} else "normal"
     args = [
         binary,
@@ -62,6 +66,8 @@ def notify(event: str, title: str, message: str = "", urgency: str = "normal") -
         str(timeout_ms),
         str(title or app_name),
     ]
+    if transient:
+        args[1:1] = ["--hint", "int:transient:1"]
     if message:
         args.append(str(message))
 

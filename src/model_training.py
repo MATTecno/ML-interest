@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pickle
 import json
+import hashlib
 import warnings
+import threading
 from pathlib import Path
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
@@ -39,8 +41,13 @@ from photo_deep_feedback import log_dataset_stats_for_training
 
 
 MODEL_PATH = ROOT_DIR / "models" / "classifier.pkl"
+FEATURE_CACHE_PATH = ROOT_DIR / "data" / "training_feature_cache.json"
 TRAINING_VERSION = 21
 logger = get_logger(__name__)
+_FEATURE_CACHE_SCHEMA_VERSION = 1
+_MODEL_CACHE_LOCK = threading.RLock()
+_MODEL_CACHE_DATA: dict | None = None
+_MODEL_CACHE_MTIME_NS = 0
 
 _META_FEATURE_NAMES = MODEL_META_FEATURE_NAMES
 _MIN_META_SAMPLES = 20
@@ -61,6 +68,107 @@ _LGBM_PARAMS = {
     "verbose": -1,
 }
 _LGBM_GPU_DISABLED = False
+
+
+def _json_default(value):
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return str(value)
+
+
+def _stable_hash(value) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=_json_default)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _pca_signature(pca) -> str:
+    if pca is None:
+        return "none"
+    parts = {
+        "class": type(pca).__name__,
+        "components": getattr(pca, "components_", None),
+        "mean": getattr(pca, "mean_", None),
+        "explained": getattr(pca, "explained_variance_ratio_", None),
+    }
+    return _stable_hash(parts)
+
+
+def _feature_cache_context(config: dict, feature_names: list[str], bio_pca=None, int_pca=None) -> str:
+    return _stable_hash({
+        "schema": _FEATURE_CACHE_SCHEMA_VERSION,
+        "training_version": TRAINING_VERSION,
+        "config": config,
+        "feature_names": feature_names,
+        "bio_pca": _pca_signature(bio_pca),
+        "int_pca": _pca_signature(int_pca),
+    })
+
+
+def _load_feature_cache() -> dict:
+    if not FEATURE_CACHE_PATH.exists():
+        return {"schema": _FEATURE_CACHE_SCHEMA_VERSION, "entries": {}}
+    try:
+        with open(FEATURE_CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("schema") != _FEATURE_CACHE_SCHEMA_VERSION:
+            return {"schema": _FEATURE_CACHE_SCHEMA_VERSION, "entries": {}}
+        entries = data.get("entries")
+        if not isinstance(entries, dict):
+            return {"schema": _FEATURE_CACHE_SCHEMA_VERSION, "entries": {}}
+        return data
+    except Exception:
+        logger.debug("Falha ao carregar cache de features de treino", exc_info=True)
+        return {"schema": _FEATURE_CACHE_SCHEMA_VERSION, "entries": {}}
+
+
+def _save_feature_cache(cache: dict) -> None:
+    FEATURE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    entries = cache.get("entries", {})
+    if isinstance(entries, dict) and len(entries) > 50000:
+        ordered = list(entries.items())[-50000:]
+        cache["entries"] = dict(ordered)
+    tmp = FEATURE_CACHE_PATH.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        tmp.replace(FEATURE_CACHE_PATH)
+    except Exception:
+        logger.debug("Falha ao salvar cache de features de treino", exc_info=True)
+
+
+def _row_cache_payload(row: pd.Series) -> dict:
+    payload = {}
+    for key, value in row.to_dict().items():
+        try:
+            if pd.isna(value):
+                payload[key] = ""
+            else:
+                payload[key] = value
+        except Exception:
+            payload[key] = value
+    return payload
+
+
+def _feature_cache_key(row: pd.Series, context_hash: str) -> str:
+    return _stable_hash({"context": context_hash, "row": _row_cache_payload(row)})
+
+
+def _cached_feature_values(entries: dict, key: str, feature_names: list[str]) -> list[float] | None:
+    entry = entries.get(key)
+    if not isinstance(entry, dict) or entry.get("feature_names") != feature_names:
+        return None
+    values = entry.get("values")
+    if not isinstance(values, list) or len(values) != len(feature_names):
+        return None
+    try:
+        return [float(v) for v in values]
+    except Exception:
+        return None
 
 
 def _lgbm_gpu_params(config: dict | None = None, force_cpu: bool = False) -> dict:
@@ -107,22 +215,41 @@ def _build_X(
     bio_pca=None,
     int_pca=None,
 ) -> np.ndarray:
-    # Pré-computa embeddings semânticos em batch (evita ~N chamadas individuais a model.encode)
-    text_feats_cache: list[dict] | None = None
-    if bio_pca is not None and int_pca is not None:
+    context_hash = _feature_cache_context(config, feature_names, bio_pca, int_pca)
+    cache = _load_feature_cache()
+    entries = cache.setdefault("entries", {})
+    row_values: list[list[float] | None] = []
+    missing: list[tuple[int, pd.Series]] = []
+    cache_hits = 0
+
+    for idx, (_, row) in enumerate(df.iterrows()):
+        key = _feature_cache_key(row, context_hash)
+        cached = _cached_feature_values(entries, key, feature_names)
+        if cached is not None:
+            row_values.append(cached)
+            cache_hits += 1
+        else:
+            row_values.append(None)
+            missing.append((idx, row))
+
+    text_feats_by_idx: dict[int, dict] = {}
+    if missing and bio_pca is not None and int_pca is not None:
         from bio_embedding import batch_text_to_features as _batch_text_to_features
-        bios_all, ints_all = [], []
-        for _, row in df.iterrows():
-            bios_all.append("" if pd.isna(row.get("bio", "")) else str(row.get("bio", "")))
+
+        bios_missing, ints_missing, idxs = [], [], []
+        for idx, row in missing:
+            idxs.append(idx)
+            bios_missing.append("" if pd.isna(row.get("bio", "")) else str(row.get("bio", "")))
             interests_raw = row.get("interests", "")
             if pd.isna(interests_raw) or not interests_raw:
-                ints_all.append([])
+                ints_missing.append([])
             else:
-                ints_all.append([x.strip() for x in str(interests_raw).split(",") if x.strip()])
-        text_feats_cache = _batch_text_to_features(bios_all, ints_all, bio_pca, int_pca)
+                ints_missing.append([x.strip() for x in str(interests_raw).split(",") if x.strip()])
+        for idx, feats in zip(idxs, _batch_text_to_features(bios_missing, ints_missing, bio_pca, int_pca)):
+            text_feats_by_idx[idx] = feats
 
-    rows = []
-    for idx, (_, row) in enumerate(df.iterrows()):
+    cache_updates = 0
+    for idx, row in missing:
         interests_raw = row.get("interests", "")
         if pd.isna(interests_raw) or not interests_raw:
             interests = []
@@ -140,13 +267,29 @@ def _build_X(
         profile["descriptors"] = "" if pd.isna(row.get("descriptors", "")) else str(row.get("descriptors", ""))
         _apply_body_corrections(profile, _parse_feedback_details(row))
 
-        if text_feats_cache is not None:
-            profile["_text_features"] = text_feats_cache[idx]
+        if idx in text_feats_by_idx:
+            profile["_text_features"] = text_feats_by_idx[idx]
 
         feats = extract_features(profile, config)
-        rows.append([feats[f] for f in feature_names])
+        values = [float(feats[f]) for f in feature_names]
+        row_values[idx] = values
+        entries[_feature_cache_key(row, context_hash)] = {
+            "feature_names": list(feature_names),
+            "values": values,
+        }
+        cache_updates += 1
 
-    return np.array(rows, dtype=float)
+    if cache_updates:
+        _save_feature_cache(cache)
+    logger.info(
+        "Feature matrix pronta: rows=%s features=%s cache_hits=%s cache_misses=%s",
+        len(df),
+        len(feature_names),
+        cache_hits,
+        len(missing),
+    )
+
+    return np.array([values or [float("nan")] * len(feature_names) for values in row_values], dtype=float)
 
 
 def _feedback_weight_config(config: dict) -> dict:
@@ -244,6 +387,25 @@ def _parse_feedback_details(row: pd.Series) -> dict:
         return {}
 
 
+def _clean_numeric_token(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return ""
+    try:
+        number = float(text)
+        if number.is_integer():
+            return str(int(number))
+    except Exception:
+        pass
+    return text
+
+
+def _truthy_token(value) -> bool:
+    return _clean_numeric_token(value).lower() in {"1", "true", "yes", "sim"}
+
+
 def _photo_score_adjustment(row: pd.Series) -> str:
     details = _parse_feedback_details(row)
     value = str(details.get("photo_score_adjustment", "") or "").strip().lower()
@@ -272,7 +434,7 @@ def _photo_adjustment_reason(row: pd.Series) -> str:
 
 def _photo_adjustment_intensity(row: pd.Series) -> str:
     details = _parse_feedback_details(row)
-    value = str(details.get("photo_score_intensity") or row.get("feedback_intensity", "") or "").strip()
+    value = _clean_numeric_token(details.get("photo_score_intensity") or row.get("feedback_intensity", ""))
     return value if value in {"1", "2", "3"} else "2"
 
 
@@ -447,10 +609,10 @@ def _sample_weights(df: pd.DataFrame, domain: str, config: dict) -> np.ndarray:
         feedback_domains = _feedback_domains(row, details) if source in {"real", "photo_deep"} else set()
         feedback_domain = _effective_feedback_domain(primary_feedback_domain, feedback_domains, domain)
         feedback_reason = str(row.get("feedback_reason", "") or "").strip().lower()
-        feedback_intensity = str(row.get("feedback_intensity", "") or "").strip()
-        corrected = str(row.get("manual_corrected", "") or "").strip()
+        feedback_intensity = _clean_numeric_token(row.get("feedback_intensity", ""))
+        corrected = _truthy_token(row.get("manual_corrected", ""))
         photo_adjustment = _photo_score_adjustment(row) if source == "real" else ""
-        final_label = str(row.get("label", "") or "").strip()
+        final_label = _clean_numeric_token(row.get("label", ""))
         ai_decision = str(row.get("ai_decision", row.get("original_label", "")) or "").strip().upper()
 
         if source == "synthetic":
@@ -502,7 +664,7 @@ def _sample_weights(df: pd.DataFrame, domain: str, config: dict) -> np.ndarray:
                 weight = max(weight, body_weight)
 
         # Correcoes manuais sao sinal forte porque a IA errou.
-        if corrected in {"1", "true", "True"}:
+        if corrected:
             weight *= manual_multiplier
             if final_label in {"0", "0.0"} and ai_decision in {"CURTIR", "SUPER_LIKE", "SUPER LIKE", "1", "1.0"}:
                 weight *= pass_correction_multiplier
@@ -1143,8 +1305,7 @@ def train_model(df: pd.DataFrame | None = None) -> Pipeline:
         evaluation = {"status": "error"}
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump({
+    model_payload = {
             "training_version": TRAINING_VERSION,
             "text_pipeline": text_pipeline,
             "photo_pipeline": photo_pipeline,
@@ -1176,7 +1337,17 @@ def train_model(df: pd.DataFrame | None = None) -> Pipeline:
             "lgbm_gpu_configured": bool(((model_cfg.get("gpu", {}) or {}).get("enabled", False))),
             "lgbm_gpu_active": bool(_is_lgbm_gpu_configured(config)),
             "evaluation": evaluation,
-        }, f)
+    }
+    with open(MODEL_PATH, "wb") as f:
+        pickle.dump(model_payload, f)
+    try:
+        mtime_ns = MODEL_PATH.stat().st_mtime_ns
+    except Exception:
+        mtime_ns = 0
+    with _MODEL_CACHE_LOCK:
+        global _MODEL_CACHE_DATA, _MODEL_CACHE_MTIME_NS
+        _MODEL_CACHE_DATA = model_payload
+        _MODEL_CACHE_MTIME_NS = mtime_ns
     logger.info(
         "Modelo salvo: path=%s type=%s total=%s photo_samples=%s",
         MODEL_PATH,
@@ -1194,9 +1365,26 @@ def train_model(df: pd.DataFrame | None = None) -> Pipeline:
 
 def load_model() -> dict | None:
     """Carrega o modelo salvo. Retorna None se nao existir ou se as features mudaram."""
+    global _MODEL_CACHE_DATA, _MODEL_CACHE_MTIME_NS
     if not MODEL_PATH.exists():
         logger.info("Modelo salvo nao encontrado: %s", MODEL_PATH)
+        with _MODEL_CACHE_LOCK:
+            _MODEL_CACHE_DATA = None
+            _MODEL_CACHE_MTIME_NS = 0
         return None
+
+    try:
+        mtime_ns = MODEL_PATH.stat().st_mtime_ns
+    except Exception:
+        mtime_ns = 0
+    with _MODEL_CACHE_LOCK:
+        if _MODEL_CACHE_DATA is not None and _MODEL_CACHE_MTIME_NS == mtime_ns:
+            logger.debug(
+                "Modelo retornado do cache: type=%s samples=%s",
+                _MODEL_CACHE_DATA.get("model_type"),
+                _MODEL_CACHE_DATA.get("n_samples"),
+            )
+            return _MODEL_CACHE_DATA
 
     try:
         with open(MODEL_PATH, "rb") as f:
@@ -1210,6 +1398,9 @@ def load_model() -> dict | None:
         print("  [model] Estrutura do modelo alterada — modelo antigo descartado, retreinando...")
         logger.warning("Modelo descartado por estrutura antiga")
         MODEL_PATH.unlink(missing_ok=True)
+        with _MODEL_CACHE_LOCK:
+            _MODEL_CACHE_DATA = None
+            _MODEL_CACHE_MTIME_NS = 0
         return None
 
     if (
@@ -1219,13 +1410,22 @@ def load_model() -> dict | None:
         print("  [model] Features alteradas — modelo antigo descartado, retreinando...")
         logger.warning("Modelo descartado por mudanca nas features")
         MODEL_PATH.unlink(missing_ok=True)
+        with _MODEL_CACHE_LOCK:
+            _MODEL_CACHE_DATA = None
+            _MODEL_CACHE_MTIME_NS = 0
         return None
 
     if data.get("training_version") != TRAINING_VERSION:
         print("  [model] Treino atualizado — modelo antigo descartado, retreinando...")
         logger.warning("Modelo descartado por versao de treino: found=%r expected=%r", data.get("training_version"), TRAINING_VERSION)
         MODEL_PATH.unlink(missing_ok=True)
+        with _MODEL_CACHE_LOCK:
+            _MODEL_CACHE_DATA = None
+            _MODEL_CACHE_MTIME_NS = 0
         return None
 
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE_DATA = data
+        _MODEL_CACHE_MTIME_NS = mtime_ns
     logger.info("Modelo carregado: type=%s samples=%s", data.get("model_type"), data.get("n_samples"))
     return data

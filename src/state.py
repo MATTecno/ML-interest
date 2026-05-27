@@ -27,6 +27,11 @@ current_visible_age: int = 0
 
 # Timestamp da última atualização via /current
 current_updated_at: float = 0.0
+current_previous_visible_name: str = ""
+current_previous_visible_id: str = ""
+current_previous_visible_age: int = 0
+current_previous_updated_at: float = 0.0
+CURRENT_FLIPFLOP_IGNORE_SECONDS = 1.2
 
 # Estado do botão de Super Like reportado pela extensão no card visível.
 current_super_like_available: bool | None = None
@@ -193,30 +198,69 @@ def set_current(
     super_like_reason: str = "",
 ) -> None:
     global current_visible_name, current_visible_id, current_visible_age, current_updated_at
+    global current_previous_visible_name, current_previous_visible_id, current_previous_visible_age, current_previous_updated_at
     global current_super_like_available, current_super_like_reason, current_super_like_updated_at
     clean_name = name.strip()
     clean_id = tinder_id.strip()
     clean_age = int(age or 0)
     clean_super_reason = (super_like_reason or "").strip() or "unknown"
     changed = False
+    ignored_flipflop = False
     with _lock:
-        changed = (
-            current_visible_name != clean_name
-            or current_visible_id != clean_id
-            or current_visible_age != clean_age
+        now = time.time()
+        if (
+            clean_id
+            and current_visible_id
+            and clean_id != current_visible_id
+            and clean_id == current_previous_visible_id
+            and _norm_name(clean_name) == _norm_name(current_visible_name)
+            and _norm_name(clean_name) == _norm_name(current_previous_visible_name)
+            and clean_age == current_visible_age
+            and clean_age == current_previous_visible_age
+            and now - current_previous_updated_at <= CURRENT_FLIPFLOP_IGNORE_SECONDS
+        ):
+            ignored_flipflop = True
+        if ignored_flipflop:
+            if super_like_available is not None:
+                current_super_like_available = bool(super_like_available)
+                current_super_like_reason = clean_super_reason
+                current_super_like_updated_at = now
+        else:
+            old_name = current_visible_name
+            old_id = current_visible_id
+            old_age = current_visible_age
+            changed = (
+                current_visible_name != clean_name
+                or current_visible_id != clean_id
+                or current_visible_age != clean_age
+            )
+            if changed:
+                current_previous_visible_name = old_name
+                current_previous_visible_id = old_id
+                current_previous_visible_age = old_age
+                current_previous_updated_at = now
+            current_visible_name = clean_name
+            current_visible_id = clean_id
+            current_visible_age = clean_age
+            current_updated_at = now
+            if super_like_available is not None:
+                current_super_like_available = bool(super_like_available)
+                current_super_like_reason = clean_super_reason
+                current_super_like_updated_at = current_updated_at
+            elif changed:
+                current_super_like_available = None
+                current_super_like_reason = "unknown"
+                current_super_like_updated_at = 0.0
+    if ignored_flipflop:
+        logger.info(
+            "Perfil visivel ignorado por flip-flop curto: name=%r age=%s id=%r current_id=%r previous_id=%r",
+            clean_name,
+            clean_age,
+            clean_id,
+            current_visible_id,
+            current_previous_visible_id,
         )
-        current_visible_name = clean_name
-        current_visible_id = clean_id
-        current_visible_age = clean_age
-        current_updated_at = time.time()
-        if super_like_available is not None:
-            current_super_like_available = bool(super_like_available)
-            current_super_like_reason = clean_super_reason
-            current_super_like_updated_at = current_updated_at
-        elif changed:
-            current_super_like_available = None
-            current_super_like_reason = "unknown"
-            current_super_like_updated_at = 0.0
+        return
     if changed:
         logger.info("Perfil visivel atualizado: name=%r age=%s id=%r", clean_name, clean_age, clean_id)
 
@@ -316,6 +360,7 @@ def remove_active_profile(name: str = "", tinder_id: str = "", age: int = 0) -> 
 def clear_active_profiles() -> None:
     global active_profile_ids, active_profile_names, active_profile_keys
     global current_visible_name, current_visible_id, current_visible_age, current_updated_at
+    global current_previous_visible_name, current_previous_visible_id, current_previous_visible_age, current_previous_updated_at
     global current_super_like_available, current_super_like_reason, current_super_like_updated_at
     global super_like_balance, super_like_balance_updated_at
     global blocking_modal_kind, blocking_modal_target, blocking_modal_x, blocking_modal_y, blocking_modal_updated_at
@@ -328,6 +373,10 @@ def clear_active_profiles() -> None:
         current_visible_id = ""
         current_visible_age = 0
         current_updated_at = 0.0
+        current_previous_visible_name = ""
+        current_previous_visible_id = ""
+        current_previous_visible_age = 0
+        current_previous_updated_at = 0.0
         current_super_like_available = None
         current_super_like_reason = "unknown"
         current_super_like_updated_at = 0.0

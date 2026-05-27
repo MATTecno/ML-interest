@@ -96,19 +96,59 @@ def _heuristic_photo_score(features: dict) -> tuple[float, dict]:
     }
 
 
-def _photo_score(features: dict, model_data: dict) -> tuple[float, dict, str, float]:
+def _photo_model_weight(config: dict) -> float:
+    model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+    return _clamp01(float(model_cfg.get("photo_supervised_weight", 0.35) or 0.35))
+
+
+def _photo_model_floor(score: float, heuristic_score: float, features: dict, config: dict) -> tuple[float, str]:
+    model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+    max_drag = _clamp01(float(model_cfg.get("photo_model_max_drag_from_heuristic", 0.12) or 0.12))
+    if max_drag <= 0:
+        return score, ""
+
+    has_face = float(features.get("photo_has_face", 0.0) or 0.0) > 0
+    similarity = _clamp01(float(features.get("photo_face_similarity", 0.5) or 0.5))
+    faces_ratio = _clamp01(float(features.get("photo_faces_ratio", 0.0) or 0.0))
+    woman_conf = _clamp01(float(features.get("photo_woman_confidence", 0.5) or 0.5))
+
+    favorable_face = (
+        has_face
+        and heuristic_score >= 0.62
+        and similarity >= 0.62
+        and faces_ratio >= 0.50
+        and woman_conf >= 0.55
+    )
+    if not favorable_face:
+        return score, ""
+
+    floored = max(score, heuristic_score - max_drag)
+    if floored > score:
+        return _clamp01(floored), "piso por rosto favorável"
+    return score, ""
+
+
+def _photo_score(features: dict, model_data: dict, config: dict | None = None) -> tuple[float, dict, str, float]:
     heuristic_score, components = _heuristic_photo_score(features)
     photo_pipeline = model_data.get("photo_pipeline")
     if photo_pipeline is None:
         return heuristic_score, components, "heurístico", heuristic_score
 
+    config = config or {}
     photo_feat_names = model_data.get("photo_feature_names") or (
         MODEL_PHOTO_FEATURE_NAMES + EMBEDDING_FEATURE_NAMES + SEMANTIC_EMBEDDING_FEATURE_NAMES
     )
     X_photo = np.array([[features[f] for f in photo_feat_names]], dtype=float)
     photo_model_prob = float(photo_pipeline.predict_proba(X_photo)[0][1])
-    score = _clamp01(photo_model_prob * 0.80 + heuristic_score * 0.20)
+    model_weight = _photo_model_weight(config)
+    heuristic_weight = 1.0 - model_weight
+    score = _clamp01(photo_model_prob * model_weight + heuristic_score * heuristic_weight)
+    score, floor_reason = _photo_model_floor(score, heuristic_score, features, config)
     components["photo_model_probability"] = round(photo_model_prob, 4)
+    components["photo_supervised_weight"] = round(model_weight, 4)
+    components["photo_heuristic_weight"] = round(heuristic_weight, 4)
+    if floor_reason:
+        components["photo_score_floor"] = floor_reason
     return round(score, 4), components, "supervisionado", photo_model_prob
 
 
@@ -121,6 +161,61 @@ def _text_score(features: dict, text_pref: dict, model_prob: float, config: dict
         _clamp01(model_prob * model_weight + text_pref_score * pref_weight),
         4,
     )
+
+
+def _score_weights_from_config(config: dict) -> tuple[float, float]:
+    model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+    photo_weight = float(model_cfg.get("photo_weight", 0.85))
+    text_weight = float(model_cfg.get("text_weight", 0.15))
+    total = photo_weight + text_weight
+    if total <= 0:
+        photo_weight, text_weight, total = 0.85, 0.15, 1.0
+    return photo_weight / total, text_weight / total
+
+
+def _text_has_explicit_negative_signal(features: dict, text_pref: dict) -> bool:
+    negative_hits = (
+        int(text_pref.get("interest_pref_negative_hits", 0) or 0)
+        + int(text_pref.get("bio_pref_negative_hits", 0) or 0)
+        + int(text_pref.get("descriptor_pref_negative_hits", 0) or 0)
+    )
+    if negative_hits > 0:
+        return True
+
+    negative_features = (
+        "bio_negative_kw",
+        "name_in_disliked",
+        "desc_has_children",
+        "desc_does_not_want_children",
+        "desc_smokes",
+        "desc_non_monogamy",
+        "desc_bad_messaging",
+    )
+    return any(float(features.get(name, 0.0) or 0.0) > 0.0 for name in negative_features)
+
+
+def _text_as_plus_score(text_score: float, features: dict, text_pref: dict) -> float:
+    if _text_has_explicit_negative_signal(features, text_pref):
+        return round(_clamp01(text_score), 4)
+    return round(max(0.5, _clamp01(text_score)), 4)
+
+
+def _combined_decision_score(
+    photo_score: float,
+    text_score: float,
+    config: dict,
+    meta_prob: float | None = None,
+) -> tuple[float, float, float]:
+    photo_weight, text_weight = _score_weights_from_config(config)
+    weighted_prob = _clamp01(photo_score * photo_weight + text_score * text_weight)
+
+    model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+    meta_weight = _clamp01(float(model_cfg.get("meta_weight", 0.0) or 0.0))
+    if meta_prob is None or meta_weight <= 0:
+        return round(weighted_prob, 4), photo_weight, text_weight
+
+    combined = _clamp01(weighted_prob * (1.0 - meta_weight) + _clamp01(meta_prob) * meta_weight)
+    return round(combined, 4), photo_weight, text_weight
 
 
 def _confidence_cap(
@@ -414,7 +509,7 @@ def predict(profile: dict, model_data: dict | None = None) -> dict:
         profile.get("_descriptors") or profile.get("descriptors") or {},
     )
 
-    photo_score, photo_components, photo_score_mode, photo_raw_prob = _photo_score(features, model_data)
+    photo_score, photo_components, photo_score_mode, photo_raw_prob = _photo_score(features, model_data, config)
     superlike_probability = None
     superlike_pipeline = model_data.get("superlike_pipeline")
     superlike_feature_names = model_data.get("superlike_feature_names") or []
@@ -427,23 +522,22 @@ def predict(profile: dict, model_data: dict | None = None) -> dict:
             superlike_probability = None
 
     meta_pipeline = model_data.get("meta_pipeline")
+    meta_model_probability = None
     if meta_pipeline is not None:
         meta_names = model_data.get("meta_feature_names") or MODEL_META_FEATURE_NAMES
         meta_X = np.array([_meta_feature_row(text_model_prob, photo_raw_prob, features, meta_names)], dtype=float)
-        raw_prob = _clamp01(float(meta_pipeline.predict_proba(meta_X)[0][1]))
-        text_score = _text_score(features, text_pref, text_model_prob, config)
-        photo_weight, text_weight = _meta_display_weights(meta_pipeline)
+        meta_model_probability = _clamp01(float(meta_pipeline.predict_proba(meta_X)[0][1]))
+        raw_text_score = _text_score(features, text_pref, text_model_prob, config)
     else:
-        text_score = _text_score(features, text_pref, text_model_prob, config)
-        model_cfg = config.get("model", {})
-        photo_weight = float(model_cfg.get("photo_weight", 0.65))
-        text_weight = float(model_cfg.get("text_weight", 0.35))
-        total = photo_weight + text_weight
-        if total <= 0:
-            photo_weight, text_weight, total = 0.65, 0.35, 1.0
-        photo_weight /= total
-        text_weight /= total
-        raw_prob = _clamp01(photo_score * photo_weight + text_score * text_weight)
+        raw_text_score = _text_score(features, text_pref, text_model_prob, config)
+
+    text_score = _text_as_plus_score(raw_text_score, features, text_pref)
+    raw_prob, photo_weight, text_weight = _combined_decision_score(
+        photo_score,
+        text_score,
+        config,
+        meta_model_probability,
+    )
 
     raw_prob, race_affinity_applied = _apply_race_affinity(raw_prob, features, config)
     raw_prob, distance_adjustment = _apply_distance_preference(raw_prob, features, config)
@@ -510,8 +604,10 @@ def predict(profile: dict, model_data: dict | None = None) -> dict:
         "photo_n_samples": model_data.get("photo_n_samples", 0),
         "text_model_probability": round(text_model_prob, 4),
         "text_score": text_score,
+        "text_raw_score": raw_text_score,
         "photo_score": photo_score,
         "photo_score_mode": photo_score_mode,
+        "meta_model_probability": round(meta_model_probability, 4) if meta_model_probability is not None else None,
         "text_preference_score": round(float(text_pref.get("text_preference_score", 0.5)), 4),
         "text_preference": text_pref,
         "photo_components": photo_components,

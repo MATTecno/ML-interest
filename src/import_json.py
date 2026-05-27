@@ -12,6 +12,7 @@ Como usar:
 import json
 import sys
 import argparse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -29,12 +30,33 @@ from photo_storage import (
 from profile_parser import parse_profile
 from config import get_photos_config
 from logging_config import get_logger, setup_logging
-from resource_guard import is_memory_pressure, memory_pressure_photo_features
+from resource_guard import get_system_resource_snapshot, is_memory_pressure, wait_for_memory_relief
 import state
 
 
 _load_photos_config = get_photos_config
 logger = get_logger(__name__)
+
+
+def _photo_unavailable_features(reason: str) -> dict:
+    """Features neutras quando evitamos trabalho visual duplicado ou caro demais."""
+    clean_reason = str(reason or "photo_unavailable").strip()
+    return {
+        "_analysis_failed": True,
+        "_analysis_skipped": True,
+        "_failure_reason": clean_reason,
+        "_photo_analysis_incomplete": True,
+        "_photos_analyzed": 0,
+        "_photos_failed": 0,
+        "_photos_timed_out": 0,
+        "photo_has_face": 1.0,
+        "photo_faces_ratio": 0.0,
+        "photo_failure_ratio": 0.0,
+        "photo_woman_confidence": 0.5,
+        "photo_skin_lightness": 0.5,
+        "photo_face_similarity": 0.5,
+        "photo_gender_certainty": 0.0,
+    }
 
 
 def _format_ml_reason(result: dict) -> str:
@@ -75,14 +97,38 @@ def _photo_memory_pressure_features(profile_name: str, stage: str) -> dict | Non
         return None
 
     logger.warning(
-        "Analise visual pulada por memoria critica: name=%r stage=%s reason=%s mem=%.1f%% avail=%.1fMB",
+        "Analise visual aguardando alivio de memoria: name=%r stage=%s reason=%s mem=%.1f%% avail=%.1fMB",
         profile_name,
         stage,
         reason,
         snapshot.get("mem_used_pct", 0.0),
         snapshot.get("mem_avail_mb", 0.0),
     )
-    return memory_pressure_photo_features(reason)
+    cleared, final_reason, final_snapshot, waited = wait_for_memory_relief()
+    if cleared:
+        logger.info(
+            "Memoria aliviou; analise visual continuara: name=%r stage=%s waited=%.1fs mem=%.1f%% avail=%.1fMB",
+            profile_name,
+            stage,
+            waited,
+            final_snapshot.get("mem_used_pct", 0.0),
+            final_snapshot.get("mem_avail_mb", 0.0),
+        )
+        return None
+    logger.warning(
+        "Memoria ainda pressionada apos espera; adiando analise visual: name=%r stage=%s waited=%.1fs reason=%s mem=%.1f%% avail=%.1fMB swap=%.1f%%",
+        profile_name,
+        stage,
+        waited,
+        final_reason,
+        final_snapshot.get("mem_used_pct", 0.0),
+        final_snapshot.get("mem_avail_mb", 0.0),
+        final_snapshot.get("swap_used_pct", 0.0),
+    )
+    return {
+        "_defer_due_memory_pressure": True,
+        "_failure_reason": f"memory_pressure:{final_reason or reason}",
+    }
 
 
 def process_response(
@@ -115,6 +161,209 @@ def process_response(
     outputs = []
     curtir_count = 0
     filtered_count = 0
+    cfg_photos = _load_photos_config()
+    normal_max = int(cfg_photos.get("max_analysis_photos", 2))
+    semantic_cfg = cfg_photos.get("semantic_embedding", {}) or {}
+    if isinstance(semantic_cfg, dict) and bool(semantic_cfg.get("enabled", False)):
+        try:
+            normal_max = max(normal_max, int(semantic_cfg.get("max_photos_per_profile", normal_max)))
+        except Exception:
+            pass
+    training_initial_max = int(cfg_photos.get("training_initial_max_photos", 1))
+    suspicious_threshold = float(cfg_photos.get("reanalyze_all_if_woman_confidence_below", 0.50))
+    suspicious_max = int(cfg_photos.get("suspicious_gender_max_photos", 6))
+    uncertain_max = int(cfg_photos.get("uncertain_max_photos", 6))
+    uncertain_threshold = float(cfg_photos.get("uncertain_probability_threshold", 0.15))
+    initial_max = training_initial_max if interactive_mode else normal_max
+    prefetch_window = 0 if interactive_mode else int(cfg_photos.get("prefetch_next_profiles", 0) or 0)
+    prefetch_workers = max(1, int(cfg_photos.get("prefetch_parallel_workers", 1) or 1))
+    prefetch_enabled = bool(cfg_photos.get("prefetch_enabled", prefetch_window > 0)) and prefetch_window > 0
+    prefetch_wait_timeout = max(0.0, float(cfg_photos.get("prefetch_wait_timeout_seconds", 2.5) or 0.0))
+    prefetch_current_max_wait = max(
+        prefetch_wait_timeout,
+        float(cfg_photos.get("prefetch_current_max_wait_seconds", 18) or 0.0),
+    )
+    prefetch_avoid_direct_duplicate = bool(cfg_photos.get("prefetch_avoid_direct_duplicate", True))
+    prefetch_futures = {}
+    parsed_cache = {}
+
+    def _profile_at(index: int) -> dict:
+        if index not in parsed_cache:
+            parsed_cache[index] = parse_profile(profiles_only[index - 1])
+        return parsed_cache[index]
+
+    if not interactive_mode:
+        current_name, current_id, current_age_visible, current_report_age = state.get_current_meta()
+        current_idx = 0
+        if current_report_age <= 10.0 and (current_name or current_id):
+            for idx in range(1, len(profiles_only) + 1):
+                candidate = _profile_at(idx)
+                id_match = current_id and str(candidate.get("_tinder_id") or "") == current_id
+                name_match = (
+                    current_name
+                    and str(candidate.get("name") or "").strip().casefold() == current_name.strip().casefold()
+                    and (not current_age_visible or int(candidate.get("age") or 0) == int(current_age_visible))
+                )
+                if id_match or name_match:
+                    current_idx = idx
+                    break
+        if current_idx > 1:
+            current_raw = profiles_only[current_idx - 1]
+            profiles_only = [current_raw] + profiles_only[: current_idx - 1] + profiles_only[current_idx:]
+            parsed_cache = {1: parse_profile(current_raw)}
+            logger.info(
+                "Perfil visivel priorizado no processamento: original_idx=%s name=%r id=%r age=%s",
+                current_idx,
+                current_name,
+                current_id,
+                current_age_visible,
+            )
+
+    prefetch_executor = ThreadPoolExecutor(max_workers=prefetch_workers, thread_name_prefix="photo-prefetch") if prefetch_enabled else None
+
+    def _prefetch_key(profile: dict) -> str:
+        return str(profile.get("_tinder_id") or f"{profile.get('name','')}:{profile.get('age','')}")
+
+    def _prefetch_window_for_current_resources() -> int:
+        if prefetch_window <= 0:
+            return 0
+        try:
+            soft_limit = float(cfg_photos.get("prefetch_memory_soft_limit_percent", 0) or 0)
+            soft_window = int(cfg_photos.get("prefetch_memory_soft_window", 1) or 1)
+            if soft_limit <= 0:
+                return prefetch_window
+            snap = get_system_resource_snapshot()
+            mem_used = float(snap.get("mem_used_pct", 0.0) or 0.0)
+            if mem_used >= soft_limit:
+                window = max(0, min(prefetch_window, soft_window))
+                logger.info(
+                    "Prefetch visual reduzido por memoria: window=%s->%s mem=%.1f%% avail=%.1fMB swap=%.1f%%",
+                    prefetch_window,
+                    window,
+                    mem_used,
+                    float(snap.get("mem_avail_mb", 0.0) or 0.0),
+                    float(snap.get("swap_used_pct", 0.0) or 0.0),
+                )
+                return window
+        except Exception:
+            logger.debug("Falha ao avaliar janela dinamica de prefetch", exc_info=True)
+        return prefetch_window
+
+    def _schedule_photo_prefetches(after_index: int) -> None:
+        if not prefetch_executor:
+            return
+        pressure, reason, snap = is_memory_pressure()
+        if pressure:
+            logger.info(
+                "Prefetch visual pausado por memoria: reason=%s mem=%.1f%% avail=%.1fMB swap=%.1f%%",
+                reason,
+                snap.get("mem_used_pct", 0.0),
+                snap.get("mem_avail_mb", 0.0),
+                snap.get("swap_used_pct", 0.0),
+            )
+            return
+        current_prefetch_window = _prefetch_window_for_current_resources()
+        if current_prefetch_window <= 0:
+            return
+        last_index = min(len(profiles_only), after_index + current_prefetch_window)
+        for idx in range(after_index + 1, last_index + 1):
+            if idx in prefetch_futures:
+                continue
+            profile = _profile_at(idx)
+            rejected, filter_reason = apply_hard_filters(profile)
+            if rejected:
+                logger.info("Prefetch visual pulado por hard_filter: idx=%s name=%r reason=%s", idx, profile.get("name"), filter_reason)
+                continue
+            analysis_urls = profile.get("_photo_urls_analysis") or []
+            if not analysis_urls:
+                continue
+            max_photos = min(len(analysis_urls), initial_max)
+            key = _prefetch_key(profile)
+            logger.info(
+                "Prefetch visual agendado: idx=%s/%s name=%r key=%s photos=%s max=%s",
+                idx,
+                len(profiles_only),
+                profile.get("name"),
+                key,
+                len(analysis_urls),
+                max_photos,
+            )
+            prefetch_futures[idx] = prefetch_executor.submit(analyze_photos, analysis_urls, profile["age"], max_photos)
+
+    def _consume_prefetched_photo(index: int, profile: dict):
+        future = prefetch_futures.pop(index, None)
+        if future is None:
+            return None
+        key = _prefetch_key(profile)
+        started = time.perf_counter()
+        try:
+            logger.info("Aguardando prefetch visual: idx=%s name=%r key=%s done=%s", index, profile.get("name"), key, future.done())
+            result = future.result(timeout=prefetch_wait_timeout if prefetch_wait_timeout > 0 else None)
+            logger.info(
+                "Prefetch visual usado: idx=%s name=%r key=%s faces=%s/%s woman=%.3f wait=%.2fs",
+                index,
+                profile.get("name"),
+                key,
+                result.get("_faces_found", 0),
+                result.get("_photos_analyzed", 0),
+                float(result.get("photo_woman_confidence", 0.5)),
+                time.perf_counter() - started,
+            )
+            return result
+        except FutureTimeoutError:
+            logger.warning(
+                "Prefetch visual atrasado: idx=%s name=%r key=%s timeout=%.2fs running=%s",
+                index,
+                profile.get("name"),
+                key,
+                prefetch_wait_timeout,
+                future.running(),
+            )
+            if prefetch_avoid_direct_duplicate and future.running():
+                extra_wait = max(0.0, prefetch_current_max_wait - prefetch_wait_timeout)
+                if extra_wait > 0:
+                    try:
+                        logger.info(
+                            "Aguardando prefetch visual para evitar analise duplicada: idx=%s name=%r key=%s extra_timeout=%.2fs",
+                            index,
+                            profile.get("name"),
+                            key,
+                            extra_wait,
+                        )
+                        result = future.result(timeout=extra_wait)
+                        logger.info(
+                            "Prefetch visual usado apos espera extra: idx=%s name=%r key=%s faces=%s/%s woman=%.3f wait=%.2fs",
+                            index,
+                            profile.get("name"),
+                            key,
+                            result.get("_faces_found", 0),
+                            result.get("_photos_analyzed", 0),
+                            float(result.get("photo_woman_confidence", 0.5)),
+                            time.perf_counter() - started,
+                        )
+                        return result
+                    except FutureTimeoutError:
+                        pass
+                logger.warning(
+                    "Prefetch visual ainda em execucao; evitando analise direta duplicada e usando features neutras: idx=%s name=%r key=%s max_wait=%.2fs",
+                    index,
+                    profile.get("name"),
+                    key,
+                    prefetch_current_max_wait,
+                )
+                return _photo_unavailable_features("prefetch_visual_timeout_sem_duplicar")
+            cancelled = future.cancel()
+            logger.warning(
+                "Prefetch visual cancelado=%s; seguindo com analise direta: idx=%s name=%r key=%s",
+                cancelled,
+                index,
+                profile.get("name"),
+                key,
+            )
+            return None
+        except Exception:
+            logger.exception("Prefetch visual falhou; analisando direto: idx=%s name=%r key=%s", index, profile.get("name"), key)
+            return None
 
     if not interactive_mode:
         print()
@@ -127,7 +376,7 @@ def process_response(
             break
 
         profile_started_at = time.perf_counter()
-        profile = parse_profile(raw)
+        profile = _profile_at(i)
         logger.info(
             "Perfil %s/%s parseado: name=%r age=%r id=%r photos=%s",
             i,
@@ -187,23 +436,11 @@ def process_response(
             if on_profile_ready:
                 if not should_cancel or not should_cancel():
                     on_profile_ready(profile, result)
+            _schedule_photo_prefetches(i)
             continue
 
         # ── Análise de fotos fora do lock (operação lenta) ──────────────────
         analysis_urls = profile.get("_photo_urls_analysis") or []
-        cfg_photos = _load_photos_config()
-        normal_max = int(cfg_photos.get("max_analysis_photos", 2))
-        semantic_cfg = cfg_photos.get("semantic_embedding", {}) or {}
-        if isinstance(semantic_cfg, dict) and bool(semantic_cfg.get("enabled", False)):
-            try:
-                normal_max = max(normal_max, int(semantic_cfg.get("max_photos_per_profile", normal_max)))
-            except Exception:
-                pass
-        training_initial_max = int(cfg_photos.get("training_initial_max_photos", 1))
-        suspicious_threshold = float(cfg_photos.get("reanalyze_all_if_woman_confidence_below", 0.50))
-        suspicious_max = int(cfg_photos.get("suspicious_gender_max_photos", 6))
-        initial_max = training_initial_max if interactive_mode else normal_max
-
         if analysis_urls:
             n_total = min(len(analysis_urls), initial_max)
             logger.info(
@@ -214,6 +451,13 @@ def process_response(
             )
             pressure_features = _photo_memory_pressure_features(profile.get("name"), "initial")
             if pressure_features is not None:
+                if pressure_features.get("_defer_due_memory_pressure"):
+                    logger.warning(
+                        "process_response adiado antes da analise de fotos: name=%r reason=%s",
+                        profile.get("name"),
+                        pressure_features.get("_failure_reason", "memory_pressure"),
+                    )
+                    break
                 photo_feat = pressure_features
                 if not interactive_mode:
                     with state.terminal_lock:
@@ -223,7 +467,9 @@ def process_response(
                     with state.terminal_lock:
                         print(f"  Analisando {n_total} foto(s)...")
                 photo_started_at = time.perf_counter()
-                photo_feat = analyze_photos(analysis_urls, profile["age"], initial_max)
+                photo_feat = _consume_prefetched_photo(i, profile)
+                if photo_feat is None:
+                    photo_feat = analyze_photos(analysis_urls, profile["age"], initial_max)
                 logger.info(
                     "Analise de fotos concluida: name=%r faces=%s/%s woman=%.3f elapsed=%.2fs",
                     profile.get("name"),
@@ -244,6 +490,13 @@ def process_response(
             if should_reanalyze:
                 pressure_features = _photo_memory_pressure_features(profile.get("name"), "gender_reanalysis")
                 if pressure_features is not None:
+                    if pressure_features.get("_defer_due_memory_pressure"):
+                        logger.warning(
+                            "Reanalise de genero adiada por memoria: name=%r reason=%s",
+                            profile.get("name"),
+                            pressure_features.get("_failure_reason", "memory_pressure"),
+                        )
+                        break
                     photo_feat.update({
                         "_reanalysis_skipped": True,
                         "_reanalysis_skip_reason": pressure_features.get("_failure_reason", "memory_pressure"),
@@ -281,10 +534,12 @@ def process_response(
                         float(photo_feat.get("photo_woman_confidence", 0.5)),
                     )
             profile["_photo_features"] = photo_feat
+            _schedule_photo_prefetches(i)
         else:
             photo_feat = {}
             profile["_photo_features"] = {}
             logger.info("Perfil sem URL de foto para analise: name=%r", profile.get("name"))
+            _schedule_photo_prefetches(i)
 
         # ── Bloco 2: resultado das fotos + ML (lock breve) ──────────────────
         photo_rejected = False
@@ -345,6 +600,7 @@ def process_response(
             if on_profile_ready:
                 if not should_cancel or not should_cancel():
                     on_profile_ready(profile, result)
+            _schedule_photo_prefetches(i)
             continue
 
         # ── Predição ML ─────────────────────────────────────────────────────
@@ -369,8 +625,6 @@ def process_response(
         )
 
         # ── Reanalisa com mais fotos se o modelo está incerto ────────────────
-        uncertain_max = int(cfg_photos.get("uncertain_max_photos", 6))
-        uncertain_threshold = float(cfg_photos.get("uncertain_probability_threshold", 0.15))
         _prob = float(result.get("probability", 0.5))
         _is_uncertain = abs(_prob - 0.5) <= uncertain_threshold
         if (
@@ -384,6 +638,14 @@ def process_response(
             _conf_pct = int(max(_prob, 1 - _prob) * 100)
             pressure_features = _photo_memory_pressure_features(profile.get("name"), "uncertain_reanalysis")
             if pressure_features is not None:
+                if pressure_features.get("_defer_due_memory_pressure"):
+                    logger.warning(
+                        "Reanalise incerto adiada por memoria: name=%r prob=%.4f reason=%s",
+                        profile.get("name"),
+                        _prob,
+                        pressure_features.get("_failure_reason", "memory_pressure"),
+                    )
+                    break
                 photo_feat.update({
                     "_uncertain_reanalysis_skipped": True,
                     "_uncertain_reanalysis_skip_reason": pressure_features.get("_failure_reason", "memory_pressure"),
@@ -437,6 +699,7 @@ def process_response(
             on_profile_ready(profile, result)
 
         outputs.append({"profile": profile, "result": result})
+        _schedule_photo_prefetches(i)
 
     total_processed = len(outputs)
     ml_processed = total_processed - filtered_count
@@ -455,6 +718,8 @@ def process_response(
         filtered_count,
         time.perf_counter() - started_at,
     )
+    if prefetch_executor:
+        prefetch_executor.shutdown(wait=False, cancel_futures=True)
     return outputs
 
 

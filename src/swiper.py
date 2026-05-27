@@ -38,7 +38,8 @@ from feedback import (
 )
 from logging_config import get_logger
 from prompt_formatter import format_interactive_prompt
-from resource_guard import is_memory_pressure
+from resource_guard import is_memory_pressure, memory_relief_reached
+from reload_controller import request_tinder_reload
 from session_summary import session_stats
 from desktop_notify import notify as desktop_notify
 
@@ -950,12 +951,15 @@ def _wait_for_memory_recovery(initial_reason: str, initial_snapshot: dict) -> bo
         if state and state.is_swipe_stop_requested():
             return False
         time.sleep(interval)
-        pressure, reason, snapshot = is_memory_pressure(load_config())
-        if not pressure:
+        cfg_now = load_config()
+        pressure, pressure_reason, snapshot = is_memory_pressure(cfg_now)
+        relief, relief_reason, snapshot = memory_relief_reached(cfg_now, snapshot)
+        if not pressure and relief:
             logger.warning(
-                "Memoria liberada; retomando swiper: mem=%.1f%% avail=%.1fMB waited=%.0fs",
+                "Memoria liberada; retomando swiper: mem=%.1f%% avail=%.1fMB swap=%.1f%% waited=%.0fs",
                 snapshot.get("mem_used_pct", 0.0),
                 snapshot.get("mem_avail_mb", 0.0),
+                snapshot.get("swap_used_pct", 0.0),
                 time.time() - announced_at,
             )
             with terminal_lock:
@@ -971,13 +975,18 @@ def _wait_for_memory_recovery(initial_reason: str, initial_snapshot: dict) -> bo
                 urgency="normal",
             )
             if request_reload and state:
-                state.request_reload("Memoria liberada apos pausa; recarregando para ressincronizar")
+                request_tinder_reload(
+                    "Memoria liberada apos pausa; recarregando para ressincronizar",
+                    source="swiper_memory_resume",
+                    navigate_to_recs=False,
+                )
             return True
         logger.info(
-            "Memoria ainda critica: %s mem=%.1f%% avail=%.1fMB",
-            reason,
+            "Memoria ainda critica: %s mem=%.1f%% avail=%.1fMB swap=%.1f%%",
+            pressure_reason or relief_reason,
             snapshot.get("mem_used_pct", 0.0),
             snapshot.get("mem_avail_mb", 0.0),
+            snapshot.get("swap_used_pct", 0.0),
         )
 
 
@@ -996,6 +1005,8 @@ class SwiperQueue:
         self._lock = Lock()
         self._running = False
         self._thread: Thread | None = None
+        self._thread_generation: int = 0
+        self._generation = 0
         self._last_sync_warning_at = 0.0
         self._summary_printed = False
         self._last_reload_at: float = 0.0
@@ -1014,21 +1025,27 @@ class SwiperQueue:
         max_pending = int(cfg.get("max_pending_queue", 40) or 0)
         drop_duplicates = bool(cfg.get("drop_duplicate_profiles", True))
         recent_ttl = float(cfg.get("recent_swipe_ttl_seconds", 600) or 0)
+
         added_pairs: list[tuple[dict, str]] = []
         skipped_duplicates = 0
         skipped_recent = 0
         dropped_old = 0
+        pending = 0
+        should_start = False
+        started_generation = 0
 
         with self._lock:
             existing_keys = {
                 key for queued_profile, _ in self._queue
                 if (key := _queue_profile_key(queued_profile)) is not None
             }
+
             if self._current_key is not None:
                 existing_keys.add(self._current_key)
 
             for profile, decision in decisions:
                 key = _queue_profile_key(profile)
+
                 if drop_duplicates and recent_ttl > 0:
                     already_swiped, _ = state.is_recently_swiped(
                         profile.get("_tinder_id", ""),
@@ -1039,30 +1056,53 @@ class SwiperQueue:
                     if already_swiped:
                         skipped_recent += 1
                         continue
+
                 if drop_duplicates and key is not None and key in existing_keys:
                     skipped_duplicates += 1
                     continue
+
                 added_pairs.append((profile, decision))
+
                 if key is not None:
                     existing_keys.add(key)
 
             self._queue.extend(added_pairs)
+
             if max_pending > 0:
                 while len(self._queue) > max_pending:
-                    self._queue.popleft()
+                    self._queue.pop()
                     dropped_old += 1
+
             pending = len(self._queue)
-            should_start = pending > 0 and not self._running
+
+            thread_alive = self._thread is not None and self._thread.is_alive()
+            thread_stale = thread_alive and self._thread_generation != self._generation
+            should_start = pending > 0 and (not thread_alive or thread_stale)
+
+            if should_start:
+                self._running = True
+                started_generation = self._generation
+                self._thread_generation = started_generation
+                self._thread = Thread(
+                    target=self._worker,
+                    args=(started_generation,),
+                    daemon=True,
+                    name=f"swiper-worker-gen-{started_generation}",
+                )
+                self._thread.start()
 
         logger.info(
-            "SwipeQueue.add: received=%s added=%s skipped_duplicates=%s skipped_recent=%s dropped_old=%s pending=%s",
+            "SwipeQueue.add: received=%s added=%s skipped_duplicates=%s skipped_recent=%s dropped_old=%s pending=%s thread_started=%s generation=%s",
             len(decisions),
             len(added_pairs),
             skipped_duplicates,
             skipped_recent,
             dropped_old,
             pending,
+            should_start,
+            started_generation if should_start else self._generation,
         )
+
         if skipped_duplicates or skipped_recent or dropped_old:
             with state.terminal_lock:
                 print(
@@ -1073,10 +1113,7 @@ class SwiperQueue:
                 )
 
         if should_start:
-            self._running = True
-            self._thread = Thread(target=self._worker, daemon=True)
-            self._thread.start()
-            logger.info("Thread do swiper iniciada")
+            logger.info("Thread do swiper iniciada generation=%s", started_generation)
 
     def pending(self) -> int:
         with self._lock:
@@ -1087,8 +1124,10 @@ class SwiperQueue:
             pending = len(self._queue)
             self._queue.clear()
             self._current_key = None
-            self._running = False
-        logger.warning("Fila de swipes limpa: pending=%s", pending)
+            self._generation += 1
+            generation = self._generation
+
+        logger.warning("Fila de swipes limpa: pending=%s generation=%s", pending, generation)
         return pending
 
     def acknowledge_network_swipe(self, tinder_id: str, action: str = "", status: int | None = None) -> int:
@@ -1180,6 +1219,12 @@ class SwiperQueue:
         try:
             import model as mdl
             import state
+
+            now = time.time()
+            last_checked = float(profile.get("_model_refresh_checked_at", 0.0) or 0.0)
+            if now - last_checked < 30.0:
+                return profile, decision
+            profile["_model_refresh_checked_at"] = now
 
             model_data = mdl.load_model()
             if model_data is None:
@@ -1285,8 +1330,9 @@ class SwiperQueue:
         current_pair: tuple[dict, str],
     ) -> bool:
         """
-        Se o perfil visível já estiver na fila, move-o para a frente e recoloca
-        o perfil atual no início logo atrás. Isso alinha prompt/screen melhor.
+        Se o perfil visível já estiver na fila, move-o para a frente e descarta
+        o current antigo. Recolocar o antigo no topo fazia cards stale voltarem
+        antes do perfil que a tela de fato mostra.
         """
         with self._lock:
             if not self._queue:
@@ -1312,9 +1358,34 @@ class SwiperQueue:
 
             visible_pair = self._queue[visible_idx]
             del self._queue[visible_idx]
-            self._queue.appendleft(current_pair)
+            stale_profile = current_pair[0] if current_pair else {}
+            stale_key = _queue_profile_key(stale_profile)
+            if stale_key is not None:
+                self._queue = deque(
+                    pair for pair in self._queue
+                    if _queue_profile_key(pair[0]) != stale_key
+                )
             self._queue.appendleft(visible_pair)
-            logger.info("Perfil visivel promovido para frente da fila: name=%r id=%r age=%s idx=%s", current_name, current_id, current_visible_age, visible_idx)
+            self._current_key = _queue_profile_key(visible_pair[0])
+            try:
+                import state
+
+                state.remove_active_profile(
+                    stale_profile.get("name", ""),
+                    stale_profile.get("_tinder_id", ""),
+                    int(stale_profile.get("age") or 0),
+                )
+            except Exception:
+                logger.debug("Falha ao remover perfil stale dos ativos apos promocao", exc_info=True)
+            logger.info(
+                "Perfil visivel promovido para frente da fila: name=%r id=%r age=%s idx=%s stale_name=%r stale_id=%r",
+                current_name,
+                current_id,
+                current_visible_age,
+                visible_idx,
+                stale_profile.get("name", ""),
+                stale_profile.get("_tinder_id", ""),
+            )
             return True
 
     def _wait_for_visible_match(
@@ -1586,13 +1657,20 @@ class SwiperQueue:
                         reason = f"{reason} | {last_detail}"
                     self._last_reload_at = now
                     self._consecutive_sync_skips = 0
-                    state.request_reload(reason)
+                    request_tinder_reload(
+                        reason,
+                        source="swiper_swipe_failure",
+                        notify_event="swipe_failure_reload",
+                        notify_title="Tinder IA vai recarregar a página",
+                        notify_message="Swipe não confirmou depois das tentativas.",
+                        urgency="critical",
+                    )
                     state.clear_active_profiles()
                     with self._lock:
                         pending = len(self._queue)
                         self._queue.clear()
                         self._current_key = None
-                        self._running = False
+                        self._generation += 1
                     session_stats.record_error()
                     session_stats.record_pending_cleared(pending)
                     with state.terminal_lock:
@@ -1601,12 +1679,6 @@ class SwiperQueue:
                             print(f"          {last_detail}")
                         if pending:
                             print(f"          Fila descartada para evitar swipes desalinhados: {pending}")
-                    desktop_notify(
-                        "swipe_failure_reload",
-                        "Tinder IA vai recarregar a página",
-                        "Swipe não confirmou depois das tentativas.",
-                        urgency="critical",
-                    )
                     logger.warning(
                         "Worker abortado por falha persistente de swipe: name=%r direction=%s detail=%s pending_cleared=%s",
                         profile.get("name"),
@@ -1651,10 +1723,10 @@ class SwiperQueue:
                 logger.info("Swipe confirmado apos intervencao manual: name=%r detail=%s", profile.get("name"), detail)
                 return True
 
-    def _worker(self) -> None:
-        import state  # import local para evitar circular na inicialização
+    def _worker(self, generation: int) -> None:
+        import state
 
-        logger.info("Worker do swiper entrou em execucao")
+        logger.info("Worker do swiper entrou em execucao generation=%s", generation)
         cfg = _load_swiper_config()
         view_min, view_max = cfg.get("view_time_range", [1.5, 4.0])
         pause_min, pause_max = cfg.get("pause_between_swipes", [0.8, 2.0])
@@ -1667,6 +1739,17 @@ class SwiperQueue:
         recent_ttl = float(cfg.get("recent_swipe_ttl_seconds", 600) or 0)
 
         while True:
+            with self._lock:
+                if generation != self._generation:
+                    if self._thread is threading.current_thread():
+                        self._running = False
+                    logger.warning(
+                        "Worker antigo finalizado por mudança de geração: worker_generation=%s current_generation=%s",
+                        generation,
+                        self._generation,
+                    )
+                    return
+
             if state.is_swipe_stop_requested():
                 pending = self.clear_pending()
                 session_stats.record_pending_cleared(pending)
@@ -1674,11 +1757,12 @@ class SwiperQueue:
                 logger.warning("Worker do swiper finalizado por hotkey antes do proximo perfil")
                 return
 
-            # ── Scheduler: aguarda se fora do horário ──────────────────────
             if not state.is_scheduler_active():
                 _sleep_with_pause(30)
                 continue
+
             _wait_while_paused()
+
             if state.is_swipe_stop_requested():
                 pending = self.clear_pending()
                 session_stats.record_pending_cleared(pending)
@@ -1691,8 +1775,10 @@ class SwiperQueue:
                 resumed = _wait_for_memory_recovery(reason, snapshot)
                 if resumed:
                     continue
+
                 pending = self.clear_pending()
                 session_stats.record_pending_cleared(pending)
+
                 with state.terminal_lock:
                     print(
                         "\n  [swipe] Memória crítica "
@@ -1700,11 +1786,13 @@ class SwiperQueue:
                         f"{snapshot.get('mem_avail_mb', 0.0):.0f}MB livres) — "
                         f"descartando {pending} swipe(s) pendente(s)\n"
                     )
+
                 logger.warning(
                     "Worker do swiper finalizado por memoria critica: reason=%s pending_cleared=%s",
                     reason,
                     pending,
                 )
+
                 desktop_notify(
                     "memory_stop",
                     "Tinder IA parou por memoria",
@@ -1714,10 +1802,22 @@ class SwiperQueue:
                 return
 
             with self._lock:
-                if not self._queue:
-                    self._running = False
-                    logger.info("Worker do swiper finalizado: fila vazia")
+                if generation != self._generation:
+                    if self._thread is threading.current_thread():
+                        self._running = False
+                    logger.warning(
+                        "Worker antigo finalizado antes de pegar item: worker_generation=%s current_generation=%s",
+                        generation,
+                        self._generation,
+                    )
                     return
+
+                if not self._queue:
+                    if self._thread is threading.current_thread():
+                        self._running = False
+                    logger.info("Worker do swiper finalizado: fila vazia generation=%s", generation)
+                    return
+
                 profile, decision = self._queue.popleft()
                 pending_after_pop = len(self._queue)
                 self._current_key = _queue_profile_key(profile)
@@ -1753,11 +1853,13 @@ class SwiperQueue:
                     continue
             profile, decision = self._refresh_if_model_changed(profile, decision)
             logger.info(
-                "Worker processando perfil: name=%r age=%r decision=%s pending=%s",
+                "Worker processando perfil: generation=%s name=%r age=%r decision=%s pending=%s sync_wait=%s",
+                generation,
                 profile.get("name"),
                 profile.get("age"),
                 decision,
                 pending_after_pop,
+                int(profile.get("_sync_wait_count", 0) or 0),
             )
 
             if profile.pop("_skip_view_once", False):
@@ -1802,7 +1904,11 @@ class SwiperQueue:
                 wait_count = int(profile.get("_sync_wait_count", 0)) + 1
                 profile["_sync_wait_count"] = wait_count
 
-                if wait_count >= sync_max_wait_count:
+                effective_sync_max_wait_count = sync_max_wait_count
+                if sync_status == "out_of_queue":
+                    effective_sync_max_wait_count = min(sync_max_wait_count, 3)
+
+                if wait_count >= effective_sync_max_wait_count:
                     now = time.time()
                     cooldown_ok = (now - self._last_reload_at) >= min_reload_interval
                     # Tenta pular o perfil antes de recarregar a página.
@@ -1818,7 +1924,7 @@ class SwiperQueue:
                         self._clear_current_key(profile)
                         with state.terminal_lock:
                             print(
-                                f"  [sync] Perfil não sincronizou após {sync_max_wait_count} tentativas"
+                                f"  [sync] Perfil não sincronizou após {effective_sync_max_wait_count} tentativas"
                                 f" — pulando ({self._consecutive_sync_skips}/{max_consecutive_sync_skips})"
                             )
                             if sync_detail:
@@ -1843,11 +1949,19 @@ class SwiperQueue:
                         )
                         self._last_reload_at = now
                         self._consecutive_sync_skips = 0
-                        state.request_reload(reason)
+                        request_tinder_reload(
+                            reason,
+                            source="swiper_sync_failure",
+                            notify_event="sync_failure_reload",
+                            notify_title="Tinder IA vai ressincronizar o Tinder",
+                            notify_message=str(reason or sync_detail or "")[:180],
+                            urgency="critical",
+                        )
                         state.clear_active_profiles()
                         with self._lock:
                             self._queue.clear()
                             self._current_key = None
+                            self._generation += 1
                         with state.terminal_lock:
                             print(
                                 f"  [sync] {max_consecutive_sync_skips} perfis pulados consecutivamente"
@@ -1855,7 +1969,6 @@ class SwiperQueue:
                             )
                             if sync_detail:
                                 print(f"         {sync_detail}")
-                        self._running = False
                         logger.warning(
                             "Worker abortado por falha persistente de sync: status=%s detail=%s",
                             sync_status,
@@ -1890,8 +2003,22 @@ class SwiperQueue:
                     continue
 
                 profile["_skip_view_once"] = True
+                with state.terminal_lock:
+                    print(
+                        f"  [sync] Tentativa {wait_count}/{effective_sync_max_wait_count}: "
+                        f"perfil esperado não bate com a tela — {profile.get('name', '?')}"
+                    )
+                    if sync_detail:
+                        print(f"         {sync_detail}")
                 self._push_front((profile, decision))
-                logger.debug("Perfil recolocado na frente aguardando sync: name=%r wait_count=%s status=%s detail=%s", profile.get("name"), wait_count, sync_status, sync_detail)
+                logger.debug(
+                    "Perfil recolocado na frente aguardando sync: name=%r wait_count=%s/%s status=%s detail=%s",
+                    profile.get("name"),
+                    wait_count,
+                    effective_sync_max_wait_count,
+                    sync_status,
+                    sync_detail,
+                )
                 now = time.time()
                 if now - self._last_sync_warning_at > 5.0:
                     self._last_sync_warning_at = now
@@ -2118,11 +2245,17 @@ class SwiperQueue:
                 logger.warning("Failsafe do PyAutoGUI acionado")
                 with state.terminal_lock:
                     print("\n  [swipe] PARADO — mouse no canto superior esquerdo (failsafe)\n")
+
                 with self._lock:
                     self._queue.clear()
+                    self._current_key = None
+                    self._generation += 1
+                    if self._thread is threading.current_thread():
+                        self._running = False
+
                 state.clear_active_profiles()
-                self._running = False
                 return
+
             except SwipePaused:
                 with state.terminal_lock:
                     print("\n  [pause] Swipe pausado antes de confirmar. Aperte F8 para retomar.\n")

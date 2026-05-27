@@ -44,8 +44,19 @@ const RECS_DEDUPE_TTL_MS = 10 * 60 * 1000;
 const RECS_DEDUPE_MAX_KEYS = 80;
 const SWIPE_CANONICAL_URL = "https://tinder.com/app/recs";
 const SWIPE_ALLOWED_PATH_PREFIXES = ["/app/recs"];
+const RELOAD_SCHEDULE_STALE_MS = 40_000;
+const RELOAD_ACK_STORAGE_KEY = "tinder_ia_pending_reload_ack";
 const PAYWALL_URL_PATTERN =
   /(paywall|purchase|checkout|payment|subscribe|subscription|plus|gold|platinum|super[-_]?like|superswipe|boost)/i;
+
+// Controle fino dos reloads.
+// O content script e o executor unico de reload/navegacao pedido pelo servidor.
+const ENABLE_SERVER_CONTROL_RELOAD = true;
+const ENABLE_SERVER_CONTROL_NAVIGATE = true;
+const ENABLE_OUT_OF_PROFILES_AUTO_RELOAD = true;
+const ENABLE_OUT_OF_PROFILES_QUEUE_RESET_ON_RELOAD = true;
+const CURRENT_REPORT_DEBOUNCE_MS = 220;
+const SAME_NAME_ID_FLIPFLOP_IGNORE_MS = 1200;
 
 // ─── 2. Mapa folder_id → {name, tinderId, age} ───────────────────────────────
 // Preenchido pelo injected.js quando intercepta o batch de perfis.
@@ -56,11 +67,20 @@ let _profileMap = {};
 let _lastReportedTinderId = "";
 let _lastReportedName = "";
 let _lastReportedAge = 0;
+let _lastReportedAt = 0;
+let _previousReportedTinderId = "";
+let _previousReportedName = "";
+let _previousReportedAge = 0;
+let _previousReportedAt = 0;
 let _redetectTimers = [];
 let _captureActive = false;
 let _lastCaptureStateKey = "";
 let _recentRecsBatches = new Map();
-const CONTROL_POLL_MS = 5_000;
+let _reloadScheduled = false;
+let _reloadScheduledAt = 0;
+let _lastControlLogKey = "";
+let _lastControlLogAt = 0;
+const CONTROL_POLL_MS = 10_000;
 
 function _isTinderHost() {
   const host = location.hostname || "";
@@ -90,6 +110,52 @@ function _postServer(path, body) {
     .catch(() => false);
 }
 
+function _postServerJson(path, body) {
+  return fetch(SERVER_BASE + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  })
+    .then(async (res) => {
+      let data = null;
+      try {
+        data = await res.json();
+      } catch (_) {}
+      return { ok: res.ok, status: res.status, data };
+    })
+    .catch((error) => ({ ok: false, status: 0, data: null, error }));
+}
+
+function _postExtensionLog(event, message, details = {}, level = "info") {
+  try {
+    fetch(SERVER_BASE + "/extension-log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: "content",
+        event,
+        message: String(message || ""),
+        level,
+        details: {
+          href: location.href,
+          visibility: document.visibilityState,
+          focused: document.hasFocus(),
+          ...details,
+        },
+      }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (_) {}
+}
+
+function _controlLogAllowed(key, minIntervalMs = 30_000) {
+  const now = Date.now();
+  if (key && key === _lastControlLogKey && now - _lastControlLogAt < minIntervalMs) return false;
+  _lastControlLogKey = key || "";
+  _lastControlLogAt = now;
+  return true;
+}
+
 function _postQueueReset(reason) {
   return _postServer("/queue-reset", { reason: reason || "fila atual invalidada pela extensão" });
 }
@@ -113,27 +179,169 @@ function _postQueueResetKeepAlive(reason) {
   } catch (_) {}
 }
 
+function _rememberPendingReloadAck(reason, mode) {
+  try {
+    sessionStorage.setItem(
+      RELOAD_ACK_STORAGE_KEY,
+      JSON.stringify({
+        reason: String(reason || "reload solicitado"),
+        mode: String(mode || "reload"),
+        href: location.href,
+        at: Date.now(),
+      })
+    );
+  } catch (_) {}
+}
+
+function _consumePendingReloadAck() {
+  let raw = "";
+  try {
+    raw = sessionStorage.getItem(RELOAD_ACK_STORAGE_KEY) || "";
+    sessionStorage.removeItem(RELOAD_ACK_STORAGE_KEY);
+  } catch (_) {
+    raw = "";
+  }
+  if (!raw) return false;
+
+  let pending = {};
+  try {
+    pending = JSON.parse(raw) || {};
+  } catch (_) {
+    pending = {};
+  }
+
+  _postServer("/reloaded", {
+    ok: true,
+    source: "content",
+    reason: pending.reason || "reload confirmado pelo content script",
+    mode: pending.mode || "reload",
+  });
+  _postExtensionLog("reload_ack_sent", pending.reason || "reload confirmado pelo content script", {
+    mode: pending.mode || "reload",
+    previous_href: pending.href || "",
+    age_ms: pending.at ? Date.now() - Number(pending.at || 0) : 0,
+  });
+  return true;
+}
+
+function _markReloadScheduled(reason, mode) {
+  _reloadScheduled = true;
+  _reloadScheduledAt = Date.now();
+  _rememberPendingReloadAck(reason, mode);
+}
+
+function _reloadScheduleIsStale() {
+  return _reloadScheduled && _reloadScheduledAt > 0 && Date.now() - _reloadScheduledAt > RELOAD_SCHEDULE_STALE_MS;
+}
+
+function _schedulePageReload(reason, delayMs, options = {}) {
+  if (_reloadScheduled && !_reloadScheduleIsStale()) {
+    _debugLog("[local] Reload ja agendado; ignorando novo pedido:", reason || "resync");
+    _postExtensionLog("reload_schedule_ignored", reason || "resync", {
+      scheduled_age_ms: Date.now() - _reloadScheduledAt,
+    });
+    return false;
+  }
+
+  if (_reloadScheduled && _reloadScheduleIsStale()) {
+    _debugWarn("[local] Reload agendado nao descarregou a pagina; liberando nova tentativa.");
+    _postExtensionLog(
+      "reload_schedule_stale",
+      "reload agendado nao descarregou a pagina; liberando nova tentativa",
+      { scheduled_age_ms: Date.now() - _reloadScheduledAt },
+      "warning"
+    );
+  }
+
+  _markReloadScheduled(reason, options.mode || "reload");
+
+  if (options.queueResetReason) {
+    _postQueueResetKeepAlive(options.queueResetReason);
+  }
+
+  if (options.notifyBackgroundOutOfProfiles) {
+    chrome.runtime.sendMessage({ type: "OUT_OF_PROFILES" });
+  }
+
+  const delay = Math.max(0, Number(delayMs) || 0);
+  _debugLog("[local] Reload agendado:", reason || "resync", `delay=${delay}ms`);
+  _postExtensionLog("reload_scheduled", reason || "resync", {
+    delay_ms: delay,
+    mode: options.mode || "reload",
+  });
+  setTimeout(() => {
+    _postExtensionLog("reload_firing", reason || "resync", { mode: options.mode || "reload" });
+    location.reload();
+  }, delay);
+  return true;
+}
+
 function _pollControl() {
   if (!_isTinderHost()) return;
   fetch(SERVER_BASE + "/control")
     .then((res) => (res.ok ? res.json() : null))
     .then((data) => {
-      if (!data || _reloadScheduled) return;
-      if (data.navigate && data.navigate_url && location.href !== data.navigate_url) {
+      if (!data) return;
+      if (data.reload || data.navigate) {
+        const controlKey = [
+          data.reload ? "r" : "",
+          data.reload_generation || 0,
+          data.navigate ? "n" : "",
+          data.navigate_generation || 0,
+          data.navigate_url || "",
+        ].join("|");
+        if (_controlLogAllowed(controlKey)) {
+          _postExtensionLog("control_received", data.navigate_reason || data.reason || "controle recebido", {
+            reload: Boolean(data.reload),
+            reload_generation: data.reload_generation || 0,
+            navigate: Boolean(data.navigate),
+            navigate_generation: data.navigate_generation || 0,
+            navigate_url: data.navigate_url || "",
+            requested_at: data.requested_at || 0,
+          });
+        }
+      }
+      if (_reloadScheduled) {
+        if (!_reloadScheduleIsStale()) return;
+        _debugWarn("[local] Reload agendado nao descarregou a pagina; liberando nova tentativa.");
+        _postExtensionLog(
+          "reload_schedule_stale",
+          "reload agendado nao descarregou a pagina; liberando nova tentativa",
+          { scheduled_age_ms: Date.now() - _reloadScheduledAt },
+          "warning"
+        );
+        _reloadScheduled = false;
+        _reloadScheduledAt = 0;
+      }
+
+      if (
+        ENABLE_SERVER_CONTROL_NAVIGATE &&
+        data.navigate &&
+        data.navigate_url &&
+        location.href !== data.navigate_url
+      ) {
         _debugLog("[local] Navegação solicitada pelo servidor:", data.navigate_reason || data.navigate_url);
-        _reloadScheduled = true;
+        _postExtensionLog("navigate_scheduled", data.navigate_reason || data.navigate_url, {
+          navigate_generation: data.navigate_generation || 0,
+          target: data.navigate_url || SWIPE_CANONICAL_URL,
+        });
+        _markReloadScheduled(data.navigate_reason || data.navigate_url, "navigate");
         _postQueueResetKeepAlive(data.navigate_reason || "voltando para a tela de swipes");
-        setTimeout(() => location.assign(data.navigate_url || SWIPE_CANONICAL_URL), 300);
+        setTimeout(() => {
+          _postExtensionLog("navigate_firing", data.navigate_reason || data.navigate_url, {
+            target: data.navigate_url || SWIPE_CANONICAL_URL,
+          });
+          location.assign(data.navigate_url || SWIPE_CANONICAL_URL);
+        }, 3000);
         return;
       }
-      if (!data.reload) return;
+
+      if (!ENABLE_SERVER_CONTROL_RELOAD || !data.reload) return;
       _debugLog("[local] Reload solicitado pelo servidor:", data.reason || "resync");
-      _reloadScheduled = true;
-      setTimeout(() => location.reload(), 300);
+      _schedulePageReload(data.reason || "resync", 3000);
     })
     .catch(() => {});
 }
-
 function _captureState() {
   const isTinder = _isTinderHost();
   const allowedSwipeUrl = _isAllowedSwipeUrl();
@@ -187,9 +395,14 @@ function _notifyCaptureState(force = false) {
   const key = `${state.active}|${state.reason}|${state.url}`;
   _captureActive = state.active;
   if (!state.active) {
+    _previousReportedTinderId = _lastReportedTinderId;
+    _previousReportedName = _lastReportedName;
+    _previousReportedAge = _lastReportedAge;
+    _previousReportedAt = _lastReportedAt;
     _lastReportedTinderId = "";
     _lastReportedName = "";
     _lastReportedAge = 0;
+    _lastReportedAt = 0;
   }
   if (!force && key === _lastCaptureStateKey) return;
   _lastCaptureStateKey = key;
@@ -450,24 +663,33 @@ function _findFrontCardRoot() {
     [0.58, 0.64],
   ];
 
-  for (const [px, py] of samplePoints) {
+  let bestPointRoot = null;
+  let bestPointScore = -Infinity;
+
+  for (const [pointIdx, [px, py]] of samplePoints.entries()) {
     const x = Math.round(window.innerWidth * px);
     const y = Math.round(window.innerHeight * py);
     const stack = document.elementsFromPoint(x, y) || [];
     const seen = new Set();
 
-    for (const el of stack.slice(0, 6)) {
+    for (let stackIdx = 0; stackIdx < Math.min(stack.length, 8); stackIdx++) {
+      const el = stack[stackIdx];
       const root = _closestCardRoot(el);
       if (!root) continue;
       if (seen.has(root)) continue;
       seen.add(root);
 
-      const score = _cardScore(root);
-      if (score > 0) {
-        return root;
+      const baseScore = _cardScore(root);
+      if (baseScore <= 0) continue;
+      const score = baseScore + (8 - stackIdx) * 50 - pointIdx * 3;
+      if (score > bestPointScore) {
+        bestPointRoot = root;
+        bestPointScore = score;
       }
     }
   }
+
+  if (bestPointRoot && bestPointScore > 0) return bestPointRoot;
 
   const selectorRoots = document.querySelectorAll(
     'div[data-keyboard-gamepad="true"][aria-hidden="false"]'
@@ -617,26 +839,58 @@ function _detectSuperLikeAvailability() {
 
 let _lastSuperLikeUpsellReportAt = 0;
 
-function _dialogText(dialog) {
+function _elementText(el) {
   return _norm(
     [
-      dialog?.innerText,
-      dialog?.textContent,
-      dialog?.getAttribute?.("aria-label"),
-      dialog?.getAttribute?.("aria-labelledby"),
+      el?.innerText,
+      el?.textContent,
+      el?.getAttribute?.("aria-label"),
+      el?.getAttribute?.("aria-labelledby"),
+      el?.getAttribute?.("title"),
+      el?.getAttribute?.("data-testid"),
+      el?.getAttribute?.("data-test-id"),
     ]
       .filter(Boolean)
       .join(" ")
   );
 }
 
-function _isSuperLikeUpsellDialog(dialog) {
-  if (!AUTO_DISMISS_SUPERLIKE_UPSELL || !_isActuallyVisible(dialog)) return false;
+function _dialogText(dialog) {
+  return _elementText(dialog);
+}
 
-  const text = _dialogText(dialog);
-  if (!text.includes("super like") && !text.includes("superlike")) return false;
-
+function _isNoThanksText(text) {
   return (
+    text.includes("nao, obrigado") ||
+    text.includes("nao, obrigada") ||
+    text.includes("nao obrigado") ||
+    text.includes("nao obrigada") ||
+    text.includes("obrigado(a)") ||
+    text.includes("agora nao") ||
+    text.includes("no thanks") ||
+    text.includes("not now") ||
+    text.includes("maybe later")
+  );
+}
+
+function _classifySuperLikeUpgradeText(text) {
+  const mentionsSuperLike = text.includes("super like") || text.includes("superlike");
+  const isPopularProfileUpgrade =
+    mentionsSuperLike &&
+    (
+      text.includes("fazer upgrade") ||
+      text.includes("perfil popular") ||
+      text.includes("popular profile") ||
+      text.includes("mandar um super like") ||
+      text.includes("send a super like")
+    );
+  if (isPopularProfileUpgrade) {
+    return { kind: "popular_profile_upgrade", reason: "popular_profile_super_like_prompt" };
+  }
+
+  if (!mentionsSuperLike) return false;
+
+  const isDepletedUpsell =
     text.includes("nao tem mais super likes") ||
     text.includes("nao tem mais super like") ||
     text.includes("sem super likes") ||
@@ -644,40 +898,178 @@ function _isSuperLikeUpsellDialog(dialog) {
     text.includes("nao quer esperar") ||
     text.includes("descolar mais super likes") ||
     text.includes("descolar mais super like") ||
-    text.includes("fazer upgrade") ||
-    text.includes("perfil popular") ||
-    text.includes("popular profile") ||
-    text.includes("upgrade")
-  );
+    text.includes("upgrade");
+  if (isDepletedUpsell) {
+    return { kind: "super_like_upsell", reason: "super_likes_depleted_prompt" };
+  }
+
+  return false;
+}
+
+function _classifySuperLikeUpgradeDialog(dialog) {
+  if (!AUTO_DISMISS_SUPERLIKE_UPSELL || !_isActuallyVisible(dialog)) return false;
+  return _classifySuperLikeUpgradeText(_dialogText(dialog));
+}
+
+function _findUpgradeRootForDecline(decline) {
+  let node = decline;
+  for (let depth = 0; node && node !== document.documentElement && depth < 14; depth++) {
+    if (node.nodeType === Node.ELEMENT_NODE && _isActuallyVisible(node)) {
+      const modal = _classifySuperLikeUpgradeText(_elementText(node));
+      if (modal) return { root: node, modal };
+    }
+    node = node.parentElement;
+  }
+
+  const bodyModal = _classifySuperLikeUpgradeText(_elementText(document.body));
+  if (bodyModal) {
+    return { root: document.body, modal: bodyModal };
+  }
+  return null;
+}
+
+function _isSuperLikeUpsellDialog(dialog) {
+  return Boolean(_classifySuperLikeUpgradeDialog(dialog));
 }
 
 function _findDialogDeclineButton(dialog) {
-  const buttons = Array.from(dialog.querySelectorAll('button, [role="button"]'))
+  const buttons = Array.from(dialog.querySelectorAll('button, [role="button"], a, [tabindex]'))
     .filter(_isActuallyVisible);
 
   return buttons.find((button) => {
-    const text = _norm(
-      [
-        button.innerText,
-        button.textContent,
-        button.getAttribute?.("aria-label"),
-        button.getAttribute?.("title"),
-        button.getAttribute?.("data-testid"),
-        button.getAttribute?.("data-test-id"),
-      ]
-        .filter(Boolean)
-        .join(" ")
-    );
-
-    return (
-      text.includes("nao, obrigado") ||
-      text.includes("nao obrigado") ||
-      text.includes("agora nao") ||
-      text.includes("no thanks") ||
-      text.includes("not now") ||
-      text.includes("maybe later")
-    );
+    const text = _elementText(button);
+    return _isNoThanksText(text);
   });
+}
+
+function _findGlobalUpgradeDeclineTarget() {
+  const candidates = Array.from(
+    document.querySelectorAll(
+      'button, [role="button"], a, [tabindex], div.c9iqosj, span'
+    )
+  ).filter(_isActuallyVisible);
+
+  for (const candidate of candidates) {
+    if (!_isNoThanksText(_elementText(candidate))) continue;
+
+    const clickable =
+      candidate.closest?.('button, [role="button"], a, [tabindex]') ||
+      candidate;
+    if (!_isActuallyVisible(clickable)) continue;
+
+    const context = _findUpgradeRootForDecline(clickable);
+    if (!context) continue;
+
+    return {
+      root: context.root,
+      modal: context.modal,
+      decline: clickable,
+      source: candidate.matches?.("div.c9iqosj")
+        ? "global_no_thanks_c9iqosj"
+        : "global_no_thanks_text",
+    };
+  }
+
+  const bodyText = _elementText(document.body);
+  const modal = _classifySuperLikeUpgradeText(bodyText);
+  if (!modal || !_isNoThanksText(bodyText)) return null;
+
+  const textNodes = [];
+  const walker = document.createTreeWalker(
+    document.body,
+    NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        return _isNoThanksText(_norm(node.nodeValue || ""))
+          ? NodeFilter.FILTER_ACCEPT
+          : NodeFilter.FILTER_SKIP;
+      },
+    }
+  );
+
+  while (textNodes.length < 8) {
+    const node = walker.nextNode();
+    if (!node) break;
+    textNodes.push(node);
+  }
+
+  for (const textNode of textNodes) {
+    const parent = textNode.parentElement;
+    const clickable =
+      parent?.closest?.('button, [role="button"], a, [tabindex]') ||
+      parent;
+    if (clickable && _isActuallyVisible(clickable)) {
+      return {
+        root: document.body,
+        modal,
+        decline: clickable,
+        source: "global_no_thanks_textnode",
+      };
+    }
+  }
+
+  return null;
+}
+
+function _findReportedUpgradeModalTarget() {
+  const dialogs = Array.from(
+    document.querySelectorAll('[role="dialog"][aria-modal="true"], [role="dialog"], [aria-modal="true"]')
+  ).filter(_isActuallyVisible);
+
+  for (const dialog of dialogs) {
+    const modal = _classifySuperLikeUpgradeDialog(dialog);
+    if (!modal) continue;
+
+    const decline = _findDialogDeclineButton(dialog);
+    return {
+      root: dialog,
+      modal,
+      decline,
+      source: decline ? "dialog_decline_button" : "dialog_backdrop",
+    };
+  }
+
+  return _findGlobalUpgradeDeclineTarget();
+}
+
+function _targetViewportPoint(target) {
+  const targetRect = target.decline?.getBoundingClientRect();
+  if (targetRect) {
+    return {
+      x: targetRect.left + targetRect.width / 2,
+      y: targetRect.top + targetRect.height / 2,
+    };
+  }
+  return _dialogBackdropPoint(target.root);
+}
+
+function _targetDialogText(target) {
+  if (target.root === document.body) {
+    return _elementText(document.body).slice(0, 220);
+  }
+  return _dialogText(target.root).slice(0, 220);
+}
+
+function _targetLabel(target) {
+  if (target.decline) {
+    return target.source || "decline_button_no_thanks";
+  }
+  return "backdrop";
+}
+
+function _reportBlockingModalTarget(target, viewportPoint) {
+  const screenPoint = _viewportPointToScreen(viewportPoint.x, viewportPoint.y);
+  const payload = {
+    kind: target.modal.kind,
+    target: _targetLabel(target),
+    reason: target.modal.reason,
+    dialog_text: _targetDialogText(target),
+    screen_x: screenPoint.x,
+    screen_y: screenPoint.y,
+    device_pixel_ratio: screenPoint.device_pixel_ratio,
+  };
+
+  chrome.runtime.sendMessage({ type: "BLOCKING_MODAL", payload });
 }
 
 function _viewportPointToScreen(x, y) {
@@ -714,38 +1106,16 @@ function _reportSuperLikeUpsellForPyAutoGui() {
     return false;
   }
 
-  const dialogs = Array.from(
-    document.querySelectorAll('[role="dialog"][aria-modal="true"], [role="dialog"]')
-  ).filter(_isActuallyVisible);
+  const target = _findReportedUpgradeModalTarget();
+  if (!target) return false;
 
-  for (const dialog of dialogs) {
-    if (!_isSuperLikeUpsellDialog(dialog)) continue;
+  const viewportPoint = _targetViewportPoint(target);
+  if (!viewportPoint) return false;
 
-    const decline = _findDialogDeclineButton(dialog);
-    const targetRect = decline?.getBoundingClientRect();
-    const viewportPoint = targetRect
-      ? {
-          x: targetRect.left + targetRect.width / 2,
-          y: targetRect.top + targetRect.height / 2,
-        }
-      : _dialogBackdropPoint(dialog);
-    if (!viewportPoint) continue;
-
-    const screenPoint = _viewportPointToScreen(viewportPoint.x, viewportPoint.y);
-    _lastSuperLikeUpsellReportAt = now;
-    _postServer("/modal", {
-      kind: "super_like_upsell",
-      target: decline ? "decline_button" : "backdrop",
-      dialog_text: _dialogText(dialog).slice(0, 220),
-      screen_x: screenPoint.x,
-      screen_y: screenPoint.y,
-      device_pixel_ratio: screenPoint.device_pixel_ratio,
-    });
-    _debugLog("[local] Modal de upgrade/Super Like reportado para clique via PyAutoGUI.");
-    return true;
-  }
-
-  return false;
+  _lastSuperLikeUpsellReportAt = now;
+  _reportBlockingModalTarget(target, viewportPoint);
+  _debugLog("[local] Modal de upgrade/Super Like reportado para clique via PyAutoGUI.");
+  return true;
 }
 
 // Busca o folder_id do card realmente visível na tela
@@ -848,20 +1218,61 @@ function _reportVisibleProfile(force = false) {
 
   if (!chosenProfile) return;
   const visibleAge = parseInt(chosenProfile.age || 0, 10) || 0;
+  const visibleName = chosenProfile.name || "";
+  const visibleId = chosenProfile.tinderId || "";
+  const now = Date.now();
   const sameVisibleProfile =
-    (chosenProfile.name || "") === _lastReportedName &&
-    (chosenProfile.tinderId || "") === _lastReportedTinderId &&
+    visibleName === _lastReportedName &&
+    visibleId === _lastReportedTinderId &&
     visibleAge === _lastReportedAge;
   if (sameVisibleProfile && !force) return;
 
-  _lastReportedTinderId = chosenProfile.tinderId || "";
-  _lastReportedName = chosenProfile.name || "";
+  const sameNameAgeAsLast =
+    _norm(visibleName) === _norm(_lastReportedName) && visibleAge === _lastReportedAge;
+  const sameNameAgeAsPrevious =
+    _norm(visibleName) === _norm(_previousReportedName) && visibleAge === _previousReportedAge;
+
+  if (
+    !force &&
+    visibleId &&
+    _previousReportedTinderId &&
+    visibleId === _previousReportedTinderId &&
+    visibleId !== _lastReportedTinderId &&
+    sameNameAgeAsLast &&
+    sameNameAgeAsPrevious &&
+    now - _lastReportedAt <= SAME_NAME_ID_FLIPFLOP_IGNORE_MS
+  ) {
+    _debugLog("[local] /current ignorado por flip-flop curto de mesmo nome/idade:", visibleName, visibleAge);
+    return;
+  }
+
+  if (
+    !force &&
+    visibleId &&
+    _lastReportedTinderId &&
+    visibleId !== _lastReportedTinderId &&
+    sameNameAgeAsLast &&
+    now - _lastReportedAt <= CURRENT_REPORT_DEBOUNCE_MS
+  ) {
+    _debugLog("[local] /current segurado por debounce curto de mesmo nome/idade:", visibleName, visibleAge);
+    return;
+  }
+
+  if (!sameVisibleProfile) {
+    _previousReportedTinderId = _lastReportedTinderId;
+    _previousReportedName = _lastReportedName;
+    _previousReportedAge = _lastReportedAge;
+    _previousReportedAt = _lastReportedAt;
+  }
+  _lastReportedTinderId = visibleId;
+  _lastReportedName = visibleName;
   _lastReportedAge = visibleAge;
+  _lastReportedAt = now;
   const superLikeState = _detectSuperLikeAvailability();
   chrome.runtime.sendMessage({
     type: "PROFILE_VISIBLE",
-    name: chosenProfile.name,
-    tinder_id: chosenProfile.tinderId || "",
+    name: visibleName,
+    tinder_id: visibleId,
     age: visibleAge,
     super_like_available: superLikeState.available,
     super_like_reason: superLikeState.reason,
@@ -885,7 +1296,8 @@ function _startVisibleTracking() {
 
   _trackingStarted = true;
   _notifyCaptureState(true);
-  if (_captureActive) {
+  const ackedPendingReload = _consumePendingReloadAck();
+  if (_captureActive && !ackedPendingReload) {
     _postServer("/reloaded", { ok: true });
   }
 
@@ -958,7 +1370,6 @@ const OUT_OF_PROFILES_TEXTS = [
 ];
 
 let _noCardCounter = 0;
-let _reloadScheduled = false;
 let _lastOfflineReloadNoticeAt = 0;
 let _outOfProfilesAt = 0;
 let _queueResetSentForOutOfProfiles = false;
@@ -969,16 +1380,26 @@ function _isOutOfProfiles() {
   const bodyText = document.body.innerText.toLowerCase();
   if (OUT_OF_PROFILES_TEXTS.some((t) => bodyText.includes(t))) return true;
 
-  // Sem foto reconhecida do mapa por várias verificações seguidas = sem card
-  if (_detectVisibleFolderId() === null && Object.keys(_profileMap).length > 0) {
+  // Detecção conservadora: só considera "sem card" quando não há folder_id,
+  // nem root de card válido, nem nome/idade visível. Isso evita limpar/recarregar
+  // enquanto o card existe mas a leitura por foto falhou momentaneamente.
+  const frontCardRoot = _findFrontCardRoot();
+  const folderId = _detectVisibleFolderId(frontCardRoot);
+  const visibleByName =
+    _extractNameAgeFromCardRoot(frontCardRoot) ||
+    _detectVisibleName(frontCardRoot || document);
+
+  const hasAnyKnownBatch = Object.keys(_profileMap).length > 0;
+  const hasVisibleCard = Boolean(folderId || frontCardRoot || visibleByName);
+
+  if (!hasVisibleCard && hasAnyKnownBatch) {
     _noCardCounter++;
-    return _noCardCounter >= 4;
+    return _noCardCounter >= 8;
   }
 
   _noCardCounter = 0;
   return false;
 }
-
 setInterval(() => {
   if (!_isCaptureActive()) return;
   if (_reloadScheduled) return;
@@ -1022,23 +1443,34 @@ setInterval(() => {
     return;
   }
 
-  // 5 minutos aguardados — hora de recarregar
-  _postServer("/reload-start", {
-    reason: "sem perfis detectados pela extensão (após 5min de espera)",
-  }).then((ok) => {
-    if (!ok) {
-      const offlineNow = Date.now();
-      if (offlineNow - _lastOfflineReloadNoticeAt > 60_000) {
-        _debugLog("[local] Sem perfis, mas o servidor está offline. Auto-reload pausado.");
-        _lastOfflineReloadNoticeAt = offlineNow;
-      }
-      _outOfProfilesAt = now; // reseta o timer, tenta de novo na próxima janela
-      return;
-    }
+  if (!ENABLE_OUT_OF_PROFILES_AUTO_RELOAD) return;
 
-    _debugLog("[local] 5 min sem perfis. Recarregando a página agora...");
-    chrome.runtime.sendMessage({ type: "OUT_OF_PROFILES" });
-    _reloadScheduled = true;
-    setTimeout(() => location.reload(), 500);
+  // 5 minutos aguardados — hora de recarregar por ausência real de perfil/card.
+  const reason = "sem perfis/card visível detectado pela extensão (após 5min de espera)";
+  const resetPromise = ENABLE_OUT_OF_PROFILES_QUEUE_RESET_ON_RELOAD
+    ? _postQueueReset(reason)
+    : Promise.resolve(true);
+
+  resetPromise.finally(() => {
+    _postServerJson("/reload-start", { reason }).then((response) => {
+      if (!response.ok) {
+        const offlineNow = Date.now();
+        if (offlineNow - _lastOfflineReloadNoticeAt > 60_000) {
+          _debugLog("[local] Sem perfis, mas o servidor está offline. Auto-reload pausado.");
+          _lastOfflineReloadNoticeAt = offlineNow;
+        }
+        _outOfProfilesAt = now; // reseta o timer, tenta de novo na próxima janela
+        return;
+      }
+
+      if (response.data?.ignored) {
+        _debugLog("[local] Backend ignorou reload de sem perfis:", response.data.ignored);
+        _outOfProfilesAt = now; // tenta novamente depois de outra janela
+        return;
+      }
+
+      _debugLog("[local] 5 min sem perfil/card. Recarregando a página agora...");
+      _schedulePageReload(reason, 500, { notifyBackgroundOutOfProfiles: true });
+    });
   });
 }, 15_000);

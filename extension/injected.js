@@ -100,6 +100,16 @@
     );
   }
 
+  function captureShouldReadResponseBody(url) {
+    try {
+      const parsed = new URL(String(url || ""), location.href);
+      const path = parsed.pathname || "";
+      if (path === "/updates" || path.startsWith("/updates/")) return false;
+      if (path === "/v2/fast-match/teaser" || path.startsWith("/v2/fast-match/teaser/")) return false;
+    } catch (_) {}
+    return true;
+  }
+
   function capturePost(payload) {
     if (!captureShouldCapture(payload?.url)) return;
     try {
@@ -256,9 +266,12 @@
 
     if (shouldCapture) {
       const responseClone = response.clone();
+      const shouldReadBody = captureShouldReadResponseBody(captureUrl);
       Promise.all([
         captureRequestBodyPromise,
-        captureIsTextResponse(responseClone) ? responseClone.text().then(captureTruncateText).catch((err) => ({ body_error: String(err?.message || err) })) : Promise.resolve({ body_omitted: "non_text_response" }),
+        shouldReadBody && captureIsTextResponse(responseClone)
+          ? responseClone.text().then(captureTruncateText).catch((err) => ({ body_error: String(err?.message || err) }))
+          : Promise.resolve({ body_omitted: shouldReadBody ? "non_text_response" : "network_capture_body_skipped" }),
       ]).then(([requestBody, responseBody]) => {
         capturePost({
           capture_type: "fetch",

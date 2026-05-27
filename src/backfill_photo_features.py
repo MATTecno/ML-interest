@@ -355,7 +355,7 @@ def backfill_semantic(limit: int | None = None, retrain: bool = True, dry_run: b
     """
     Preenche photo_clip_pc_* e métricas de carrossel usando fotos salvas.
 
-    O embedding bruto fica em data/photo_semantic_cache.json; o CSV recebe só
+    O embedding bruto fica em data/photo_semantic_cache.sqlite; o CSV recebe só
     as features compactadas por PCA e métricas agregadas por perfil.
     """
     logger.info("Backfill semantico CLIP iniciado: limit=%s retrain=%s dry_run=%s", limit, retrain, dry_run)
