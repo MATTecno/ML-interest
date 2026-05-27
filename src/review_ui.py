@@ -2089,22 +2089,16 @@ def _render_similar_trigger(row: dict) -> str:
 # Renderização dos cards
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _render_card(row: dict, prefs: dict) -> str:
+def _review_photo_html(row: dict) -> str:
     review_id = row.get("review_id", "")
-    interests = _parse_interests(row.get("interests", ""))
-    descriptors = _parse_descriptors(row.get("descriptors", ""))
-    original = _decision_label(row.get("original_label", row.get("label", "")))
-    bio = row.get("bio", "") or ""
-    distance_label = _distance_text(row)
-
     _face_url = _photo_url(row)
     _body_url = _body_photo_url(row)
     _name_esc = _esc(row.get("name"))
     _rid = _esc(review_id)
     if not _photo_available(row):
-        photo_html = '<div class="photo-missing">foto indisponível<br><small>não foi salva neste perfil</small></div>'
-    elif _body_url:
-        photo_html = (
+        return '<div class="photo-missing">foto indisponível<br><small>não foi salva neste perfil</small></div>'
+    if _body_url:
+        return (
             f'<div class="carousel" id="carousel-{_rid}">'
             f'<div class="carousel-slides">'
             f'<img class="cs active" src="{_esc(_face_url)}" alt="Rosto - {_name_esc}" loading="lazy" decoding="async"'
@@ -2122,11 +2116,83 @@ def _render_card(row: dict, prefs: dict) -> str:
             f'<button class="carousel-arrow right" onclick="carouselStep(\'{_rid}\',1)">&#8250;</button>'
             f'</div>'
         )
-    else:
-        photo_html = (
-            f'<img src="{_esc(_face_url)}" alt="Foto de {_name_esc}" loading="lazy" decoding="async" onclick="btLightbox(this.src)" '
-            f'onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{className:\'photo-missing\',innerHTML:\'foto indisponível<br><small>URL expirou ou arquivo foi removido</small>\'}}))">'
-        )
+    return (
+        f'<img src="{_esc(_face_url)}" alt="Foto de {_name_esc}" loading="lazy" decoding="async" onclick="btLightbox(this.src)" '
+        f'onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),{{className:\'photo-missing\',innerHTML:\'foto indisponível<br><small>URL expirou ou arquivo foi removido</small>\'}}))">'
+    )
+
+
+def _render_visual_review_card(row: dict, prefs: dict) -> str:
+    review_id = row.get("review_id", "")
+    original = _decision_label(row.get("original_label", row.get("label", "")))
+    decision_cls = "like" if original in {"CURTIR", "SUPER LIKE"} else "pass"
+    visual_label_options = _visual_label_select()
+    metrics = (
+        f'<span>mulher <b>{_pct(row, "photo_woman_confidence")}</b></span>'
+        f'<span>similar <b>{_pct(row, "photo_face_similarity")}</b></span>'
+        f'<span>sorriso <b>{_pct(row, "photo_face_smile_score")}</b></span>'
+        f'<span>faces <b>{_pct(row, "photo_faces_ratio")}</b></span>'
+    )
+    visual_html = _render_visual_breakdown({}, row)
+    body_inference_html = _body_inference_html(row)
+    photo_html = _review_photo_html(row)
+    distance_label = _distance_text(row)
+
+    return f"""
+      <article class="card visual-review-card" id="card-{_esc(review_id)}" data-has-photo="1">
+        <div class="photo">{photo_html}</div>
+        <div class="content">
+          <div class="topline">
+            <div>
+              <h2>{_esc(row.get("name"))} <span>{_esc(row.get("age"))}</span></h2>
+              <p class="muted">avaliação visual separada{(" · " + _esc(distance_label)) if distance_label else ""}</p>
+            </div>
+            <div class="decision {decision_cls}">{original}</div>
+          </div>
+          <div class="metrics">{metrics}</div>
+          {visual_html}
+          {body_inference_html}
+          <form class="review-form visual-review-form" method="post" action="/visual-review-save">
+            <input type="hidden" name="review_id" value="{_esc(review_id)}">
+            <div class="form-title">Só visual</div>
+            <div class="fields">
+              <div class="detail-slot visual-label-wrap">
+                <span class="field-title">Marque sem considerar bio, interesses ou decisão final</span>
+                <div class="visual-label-grid">
+                  <label>Rosto
+                    <select name="visual_face_label">{visual_label_options}</select>
+                  </label>
+                  <label>Corpo
+                    <select name="visual_body_label">{visual_label_options}</select>
+                  </label>
+                  <label>Estilo / qualidade
+                    <select name="visual_style_label">{visual_label_options}</select>
+                  </label>
+                  <label>Foto geral
+                    <select name="visual_overall_label">{visual_label_options}</select>
+                  </label>
+                </div>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="btn like">Salvar visual</button>
+              <button class="btn ghost" type="submit" formaction="/skip" formnovalidate>Pular</button>
+            </div>
+          </form>
+        </div>
+      </article>
+    """
+
+
+def _render_card(row: dict, prefs: dict) -> str:
+    review_id = row.get("review_id", "")
+    interests = _parse_interests(row.get("interests", ""))
+    descriptors = _parse_descriptors(row.get("descriptors", ""))
+    original = _decision_label(row.get("original_label", row.get("label", "")))
+    bio = row.get("bio", "") or ""
+    distance_label = _distance_text(row)
+
+    photo_html = _review_photo_html(row)
 
     interest_tags = "".join(
         f'<span class="{_interest_class(i, prefs)}">{_esc(i)}</span>'
@@ -4272,9 +4338,9 @@ def _render_page(
     prefs = _load_prefs()
     photo_deep_enabled = _photo_deep_enabled()
     if not photo_deep_enabled and initial_tab == "photo-deep":
-        initial_tab = ""
-    if initial_tab not in ("photo-deep", "body-train", "signal-train"):
-        initial_tab = initial_tab if initial_tab == "photo-deep" else ""
+        initial_tab = "visual-review"
+    if initial_tab not in ("visual-review", "photo-deep", "body-train", "signal-train"):
+        initial_tab = "visual-review"
     if sort_mode not in ("priority", "uncertain", "confident", "recent"):
         sort_mode = "priority"
     hidden_filters, hidden_duplicates = _cleanup_review_queue_once()
@@ -4288,15 +4354,17 @@ def _render_page(
     deep_n = count_deep_records() if photo_deep_enabled else 0
     _, bt_total = _body_train_profiles(page=0, per_page=1)
     initial_tab_json = json.dumps(initial_tab or "")
-    main_hidden = initial_tab in ("photo-deep", "body-train", "signal-train")
+    main_hidden = True
+    visual_hidden = initial_tab != "visual-review"
     deep_hidden = initial_tab != "photo-deep"
     bt_hidden = initial_tab != "body-train"
     signal_hidden = initial_tab != "signal-train"
     main_attr = " hidden" if main_hidden else ""
+    visual_attr = " hidden" if visual_hidden else ""
     deep_attr = " hidden" if deep_hidden else ""
     bt_attr = " hidden" if bt_hidden else ""
     signal_attr = " hidden" if signal_hidden else ""
-    tab_main_active = "" if main_hidden else " active"
+    tab_visual_active = " active" if not visual_hidden else ""
     tab_deep_active = " active" if not deep_hidden else ""
     tab_bt_active = " active" if not bt_hidden else ""
     tab_signal_active = " active" if not signal_hidden else ""
@@ -4339,6 +4407,23 @@ def _render_page(
           <a href="/?all=1">mostrar todos</a>
         </div>"""
 
+    visual_pending = [row for row in pending if _photo_available(row)]
+    visible_visual = visual_pending if show_all else visual_pending[:REVIEW_PAGE_LIMIT]
+    hidden_visual = max(0, len(visual_pending) - len(visible_visual))
+    visual_cards = "\n".join(_render_visual_review_card(row, prefs) for row in visible_visual)
+    if not visual_cards:
+        visual_cards = """
+        <div class="empty">
+          <h2>Nada visual pendente</h2>
+          <p>Não há perfis pendentes com foto local para avaliar visualmente.</p>
+        </div>"""
+    elif hidden_visual:
+        visual_cards += f"""
+        <div class="more-pending">
+          Mostrando {len(visible_visual)} de {len(visual_pending)} avaliações visuais para manter a tela rápida.
+          <a href="/?tab=visual-review&all=1">mostrar todas</a>
+        </div>"""
+
     reviewed_rows = "".join(_render_reviewed_row(r) for r in reviewed_sorted[:20])
     if not reviewed_rows:
         reviewed_rows = '<p class="muted" style="font-family:ui-sans-serif;font-size:13px;padding:8px">Nenhuma revisão feita ainda.</p>'
@@ -4373,9 +4458,9 @@ def _render_page(
     )
     bt_count_pill = f' <span style="font-size:10px;opacity:.7">({bt_total})</span>' if bt_total else ""
     subtitle = (
-        "Correção pós-swipe para o treino principal."
+        "Avaliações separadas por aba; a revisão completa de perfil está oculta temporariamente."
         if not photo_deep_enabled
-        else "Correção pós-swipe (treino principal) e avaliação extra só de fotos (opcional)."
+        else "Avaliações separadas por aba; a revisão completa de perfil está oculta temporariamente."
     )
     history_stats = history_review_candidate_stats()
     history_actionable = int(history_stats.get("actionable", 0) or 0)
@@ -4414,11 +4499,21 @@ def _render_page(
     {retrain_notice_html}
     {eval_summary_html}
     <nav class="review-tabs" role="tablist" aria-label="Modos de revisão">
-      <button type="button" class="tab-btn{tab_main_active}" data-tab="main" role="tab" aria-controls="tab-main" aria-selected="{str(not main_hidden).lower()}">Revisão pós-swipe</button>
+      <button type="button" class="tab-btn{tab_visual_active}" data-tab="visual-review" role="tab" aria-controls="tab-visual-review" aria-selected="{str(not visual_hidden).lower()}">Avaliação visual</button>
       {tab_deep_button}
       <button type="button" class="tab-btn{tab_bt_active}" data-tab="body-train" role="tab" aria-controls="tab-body-train" aria-selected="{str(not bt_hidden).lower()}">Treino corporal<span id="bt-count-pill">{bt_total if bt_total else ""}</span></button>
       <button type="button" class="tab-btn{tab_signal_active}" data-tab="signal-train" role="tab" aria-controls="tab-signal-train" aria-selected="{str(not signal_hidden).lower()}">Treino de sinais</button>
     </nav>
+    <div id="tab-visual-review" class="tab-panel"{visual_attr} role="tabpanel">
+      <div class="toolbar">
+        <span class="pill">visuais com foto: <b>{len(visual_pending)}</b></span>
+        <form method="post" action="/retrain">
+          <input type="hidden" name="redirect_tab" value="visual-review">
+          <button class="btn ghost" id="retrain-button">Retreinar modelo agora</button>
+        </form>
+      </div>
+      {visual_cards}
+    </div>
     <div id="tab-main" class="tab-panel"{main_attr} role="tabpanel">
     <div class="toolbar">
       <span class="pill">mostrando <b>{len(visible_pending)}</b> de <b>{len(pending)}</b></span>
@@ -4449,9 +4544,9 @@ def _render_page(
       {signal_panel_html}
     </div>
   </main>
-  <script>
+    <script>
     function setReviewTab(which) {{
-      ['tab-main','tab-photo-deep','tab-body-train','tab-signal-train'].forEach(function(id) {{
+      ['tab-visual-review','tab-main','tab-photo-deep','tab-body-train','tab-signal-train'].forEach(function(id) {{
         var el = document.getElementById(id);
         if (el) el.hidden = (id !== 'tab-' + which);
       }});
@@ -4494,13 +4589,14 @@ def _render_page(
         setReviewTab(target);
         try {{
           var u = new URL(location.href);
-          if (target === 'photo-deep' || target === 'body-train' || target === 'signal-train') u.searchParams.set('tab', target);
+          if (target === 'visual-review' || target === 'photo-deep' || target === 'body-train' || target === 'signal-train') u.searchParams.set('tab', target);
           else u.searchParams.delete('tab');
           history.replaceState(null, '', u.pathname + u.search + u.hash);
         }} catch (e) {{}}
       }});
     }});
     var tabInit = {initial_tab_json};
+    if (tabInit === 'visual-review') setReviewTab('visual-review');
     if (tabInit === 'photo-deep') setReviewTab('photo-deep');
     if (tabInit === 'body-train') setReviewTab('body-train');
     if (tabInit === 'signal-train') setReviewTab('signal-train');
@@ -4767,8 +4863,9 @@ def _render_page(
               card.style.opacity = '0';
               card.style.transform = 'translateY(-6px)';
               setTimeout(function() {{
+                var wasVisualOnly = card.classList.contains('visual-review-card');
                 card.remove();
-                _fillReviewSlots();
+                if (!wasVisualOnly) _fillReviewSlots();
               }}, 190);
             }}
             _showAjaxNotice(j.message || 'Revisão salva.', j.type || 'ok');
@@ -5226,6 +5323,7 @@ def _render_page(
         bind(pos, neg);
         bind(neg, pos);
         form.addEventListener('submit', function(ev) {{
+          if (form.classList.contains('visual-review-form')) return;
           var submitter = ev.submitter;
           if (!submitter || submitter.getAttribute('formaction') === '/agree' || submitter.getAttribute('formaction') === '/skip') return;
           if (!requireReasonDomains(form)) {{
@@ -5663,8 +5761,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/":
             tab = (qs.get("tab", [""])[0] or "").strip().lower()
-            if tab not in ("photo-deep", "body-train", "signal-train"):
-                tab = ""
+            if tab not in ("visual-review", "photo-deep", "body-train", "signal-train"):
+                tab = "visual-review"
             initial_tab = tab
             selected = qs.get("selected", [""])[0]
             show_all = (qs.get("all", [""])[0] or "").strip() == "1"
@@ -5823,6 +5921,63 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "message": f"Falha ao salvar sinal: {exc}", "type": "err"}, status=400)
                     return
                 self._redirect(f"Falha ao salvar sinal: {exc}", "err", extra_params=extra)
+            return
+
+        if self.path == "/visual-review-save":
+            ajax = self._form_one(form, "ajax") == "1"
+            review_id = self._form_one(form, "review_id")
+            visual_face_label = _clean_visual_label(self._form_one(form, "visual_face_label"))
+            visual_body_label = _clean_visual_label(self._form_one(form, "visual_body_label"))
+            visual_style_label = _clean_visual_label(self._form_one(form, "visual_style_label"))
+            visual_overall_label = _clean_visual_label(self._form_one(form, "visual_overall_label"))
+            labels = {
+                "visual_face_label": visual_face_label,
+                "visual_body_label": visual_body_label,
+                "visual_style_label": visual_style_label,
+                "visual_overall_label": visual_overall_label,
+            }
+            if not any(labels.values()):
+                msg = "Marque pelo menos um campo visual antes de salvar."
+                if ajax:
+                    self._send_json({"ok": False, "message": msg, "type": "err"}, status=400)
+                    return
+                self._redirect(msg, "err", extra_params={"tab": "visual-review"})
+                return
+
+            label_summary = [
+                f"{name}={value}"
+                for name, value in (
+                    ("rosto", visual_face_label),
+                    ("corpo", visual_body_label),
+                    ("estilo", visual_style_label),
+                    ("geral", visual_overall_label),
+                )
+                if value
+            ]
+            details = {
+                "visual_only": True,
+                "primary_domain": "photo",
+                "selected_domains": ["photo"],
+                **labels,
+            }
+            details = {k: v for k, v in details.items() if v not in ("", [], {})}
+            feedback_reason = "avaliacao_visual: " + ", ".join(label_summary)
+            ok = apply_review(
+                review_id=review_id,
+                final_decision="TALVEZ",
+                feedback_domain="photo",
+                feedback_reason=feedback_reason,
+                feedback_intensity="2",
+                feedback_secondary="",
+                feedback_details=json.dumps(details, ensure_ascii=False, sort_keys=True),
+            )
+            if ok:
+                _maybe_start_review_auto_retrain("visual_review")
+            msg = "Avaliação visual salva sem treinar a decisão geral." if ok else "Revisão não encontrada."
+            if ajax:
+                self._send_json({"ok": ok, "message": msg, "review_id": review_id, "type": "ok" if ok else "err"})
+                return
+            self._redirect(msg, "ok" if ok else "err", extra_params={"tab": "visual-review"})
             return
 
         if self.path == "/apply":

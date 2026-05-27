@@ -1226,6 +1226,21 @@ class AlgorithmImprovementTests(unittest.TestCase):
             model_training._sample_weights(df, "text", cfg)[0],
         )
 
+    def test_visual_labels_train_photo_even_without_general_profile_label(self):
+        import pandas as pd
+
+        visual_row = pd.Series({
+            "label": "",
+            "feedback_details": json.dumps({"visual_overall_label": "negative"}),
+        })
+        neutral_row = pd.Series({
+            "label": "",
+            "feedback_details": json.dumps({"visual_face_label": "neutral"}),
+        })
+
+        self.assertEqual(model_training._photo_training_label(visual_row), 0)
+        self.assertIsNone(model_training._photo_training_label(neutral_row))
+
     def test_photo_deep_feedback_gets_visual_training_weight(self):
         import pandas as pd
 

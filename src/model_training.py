@@ -607,7 +607,7 @@ def _photo_detail_reason(row: pd.Series, target_label: int) -> str:
     return sorted(counts.items(), key=lambda item: (-item[1], priority.get(item[0], 99)))[0][0]
 
 
-def _photo_target_label(row: pd.Series, photo_adjustment: str = "") -> int:
+def _photo_directional_label(row: pd.Series, photo_adjustment: str = "") -> int | None:
     if photo_adjustment == "higher":
         return 1
     if photo_adjustment == "lower":
@@ -615,6 +615,24 @@ def _photo_target_label(row: pd.Series, photo_adjustment: str = "") -> int:
     visual_label = _visual_target_label(row)
     if visual_label is not None:
         return int(visual_label)
+    return None
+
+
+def _photo_training_label(row: pd.Series) -> int | None:
+    explicit = _photo_directional_label(row, _photo_score_adjustment(row))
+    if explicit is not None:
+        return explicit
+    try:
+        label = int(float(row.get("label", "")))
+        return label if label in {0, 1} else None
+    except Exception:
+        return None
+
+
+def _photo_target_label(row: pd.Series, photo_adjustment: str = "") -> int:
+    explicit = _photo_directional_label(row, photo_adjustment)
+    if explicit is not None:
+        return explicit
     try:
         return int(float(row.get("label", 0) or 0))
     except Exception:
@@ -628,8 +646,8 @@ def _training_labels(df: pd.DataFrame, domain: str) -> np.ndarray:
 
     adjusted = labels.copy()
     for idx, (_, row) in enumerate(df.iterrows()):
-        adjustment = _photo_score_adjustment(row)
-        adjusted[idx] = _photo_target_label(row, adjustment)
+        label = _photo_training_label(row)
+        adjusted[idx] = 0 if label is None else label
     return adjusted
 
 
@@ -1250,10 +1268,12 @@ def train_model(df: pd.DataFrame | None = None) -> Pipeline:
     min_photo_samples = int(model_cfg.get("min_photo_samples_for_model", 8))
 
     if df is None:
-        df = load_all_data()
+        df_all = load_all_data(include_untrainable=True)
+    else:
+        df_all = df.copy()
 
-    label_numeric = pd.to_numeric(df.get("label", ""), errors="coerce")
-    df = df[label_numeric.isin([0, 1])].copy()
+    label_numeric = pd.to_numeric(df_all.get("label", ""), errors="coerce")
+    df = df_all[label_numeric.isin([0, 1])].copy()
     df["label"] = pd.to_numeric(df["label"], errors="coerce").astype(int)
 
     if len(df) == 0:
@@ -1299,8 +1319,12 @@ def train_model(df: pd.DataFrame | None = None) -> Pipeline:
         int_pca=int_pca,
     )
 
-    photo_saved = pd.to_numeric(df.get("photo_features_saved", 0), errors="coerce").fillna(0)
-    photo_df = df[photo_saved > 0].copy()
+    photo_saved = pd.to_numeric(df_all.get("photo_features_saved", 0), errors="coerce").fillna(0)
+    photo_labels = df_all.apply(_photo_training_label, axis=1)
+    photo_mask = (photo_saved > 0) & photo_labels.notna()
+    photo_df = df_all[photo_mask].copy()
+    if not photo_df.empty:
+        photo_df["label"] = [int(label) for label in photo_labels[photo_mask]]
     photo_deep_df = _photo_deep_feedback_df(config, pca=pca, semantic_pca=semantic_pca)
     if not photo_deep_df.empty:
         photo_df = pd.concat([photo_df, photo_deep_df], ignore_index=True, sort=False)
