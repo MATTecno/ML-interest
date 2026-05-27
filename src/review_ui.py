@@ -151,14 +151,36 @@ def _clean_visual_label(value: str) -> str:
     return clean if clean in {"positive", "neutral", "negative"} else ""
 
 
-def _visual_label_select() -> str:
+def _visual_label_choices(field_name: str, title: str) -> str:
     options = [
-        ("", "sem marcar"),
-        ("positive", "gostei"),
-        ("neutral", "neutro"),
-        ("negative", "não gostei"),
+        ("positive", "gostei", "positive"),
+        ("neutral", "neutro", "neutral"),
+        ("negative", "não gostei", "negative"),
     ]
-    return "\n".join(f'<option value="{value}">{_esc(label)}</option>' for value, label in options)
+    chips = "\n".join(
+        f'<label class="chip-check visual-choice {cls}">'
+        f'<input type="checkbox" name="{_esc(field_name)}" value="{_esc(value)}">'
+        f"<span>{_esc(label)}</span></label>"
+        for value, label, cls in options
+    )
+    return (
+        f'<div class="visual-label-group">'
+        f'<span class="visual-label-title">{_esc(title)}</span>'
+        f'<div class="visual-choice-row">{chips}</div>'
+        f"</div>"
+    )
+
+
+def _visual_label_grid() -> str:
+    return "\n".join(
+        _visual_label_choices(field_name, title)
+        for field_name, title in (
+            ("visual_face_label", "Rosto"),
+            ("visual_body_label", "Corpo"),
+            ("visual_style_label", "Estilo / qualidade"),
+            ("visual_overall_label", "Foto geral"),
+        )
+    )
 
 
 def _primary_domain_from_details(details: dict, fallback: str = "other") -> str:
@@ -2126,7 +2148,7 @@ def _render_visual_review_card(row: dict, prefs: dict) -> str:
     review_id = row.get("review_id", "")
     original = _decision_label(row.get("original_label", row.get("label", "")))
     decision_cls = "like" if original in {"CURTIR", "SUPER LIKE"} else "pass"
-    visual_label_options = _visual_label_select()
+    visual_label_controls = _visual_label_grid()
     metrics = (
         f'<span>mulher <b>{_pct(row, "photo_woman_confidence")}</b></span>'
         f'<span>similar <b>{_pct(row, "photo_face_similarity")}</b></span>'
@@ -2159,18 +2181,7 @@ def _render_visual_review_card(row: dict, prefs: dict) -> str:
               <div class="detail-slot visual-label-wrap">
                 <span class="field-title">Marque sem considerar bio, interesses ou decisão final</span>
                 <div class="visual-label-grid">
-                  <label>Rosto
-                    <select name="visual_face_label">{visual_label_options}</select>
-                  </label>
-                  <label>Corpo
-                    <select name="visual_body_label">{visual_label_options}</select>
-                  </label>
-                  <label>Estilo / qualidade
-                    <select name="visual_style_label">{visual_label_options}</select>
-                  </label>
-                  <label>Foto geral
-                    <select name="visual_overall_label">{visual_label_options}</select>
-                  </label>
+                  {visual_label_controls}
                 </div>
               </div>
             </div>
@@ -2244,7 +2255,7 @@ def _render_card(row: dict, prefs: dict) -> str:
 
     photo_positive_choices = _photo_fine_choices("photo_positive_detail", "positive", True)
     photo_negative_choices = _photo_fine_choices("photo_negative_detail", "negative", False)
-    visual_label_options = _visual_label_select()
+    visual_label_controls = _visual_label_grid()
 
     metrics = (
         f'<span>mulher <b>{_pct(row, "photo_woman_confidence")}</b></span>'
@@ -2298,18 +2309,7 @@ def _render_card(row: dict, prefs: dict) -> str:
               <div class="detail-slot visual-label-wrap">
                 <span class="field-title">Avaliação visual separada</span>
                 <div class="visual-label-grid">
-                  <label>Rosto
-                    <select name="visual_face_label">{visual_label_options}</select>
-                  </label>
-                  <label>Corpo
-                    <select name="visual_body_label">{visual_label_options}</select>
-                  </label>
-                  <label>Estilo / qualidade
-                    <select name="visual_style_label">{visual_label_options}</select>
-                  </label>
-                  <label>Foto geral
-                    <select name="visual_overall_label">{visual_label_options}</select>
-                  </label>
+                  {visual_label_controls}
                 </div>
               </div>
               <div class="reason-picker">
@@ -3335,10 +3335,48 @@ _CSS = """
     }
     .visual-label-grid {
       display: grid;
-      grid-template-columns: repeat(4, minmax(130px, 1fr));
-      gap: 8px;
+      grid-template-columns: repeat(2, minmax(220px, 1fr));
+      gap: 10px;
     }
-    .visual-label-grid label { min-width: 0; }
+    .visual-label-group {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+      background: rgba(255,255,255,.58);
+    }
+    .visual-label-title {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--ink);
+      font-weight: 800;
+      font-size: 12px;
+    }
+    .visual-choice-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .visual-choice {
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1.2;
+      min-height: 32px;
+    }
+    .visual-choice.neutral {
+      border-color: #fde68a;
+      background: #fffdf0;
+      color: var(--mid);
+    }
+    .visual-choice:has(input:checked) {
+      outline: 2px solid currentColor;
+      outline-offset: 1px;
+      font-weight: 800;
+    }
+    .visual-choice:has(input:checked) span::after {
+      content: " ✓";
+      font-weight: 900;
+    }
     .photo-detail-wrap { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(180px, 240px) repeat(2, minmax(180px, 1fr)); gap: 10px; }
     .photo-detail-wrap > label { grid-column: auto; }
     .interests-detail-wrap, .bio-detail-wrap, .desc-detail-wrap, .other-detail-wrap { grid-column: 1 / -1; }
@@ -3790,6 +3828,9 @@ _CSS = """
       .deep-top { grid-template-columns: 1fr; }
       .deep-row { grid-template-columns: 1fr; }
       .bt-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 560px) {
+      .visual-label-grid { grid-template-columns: 1fr; }
     }
     /* ── Body Training Tab ── */
     .bt-header { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px; margin-bottom:16px; font-family:ui-sans-serif,system-ui,sans-serif; font-size:13px; color:var(--muted); }
@@ -4681,6 +4722,20 @@ def _render_page(
         sel.selectedIndex = 0;
       }});
     }}
+    function bindVisualLabelChoices(root) {{
+      (root || document).querySelectorAll('.visual-label-group input[type="checkbox"]').forEach(function(inp) {{
+        if (inp.dataset.visualBound === '1') return;
+        inp.dataset.visualBound = '1';
+        inp.addEventListener('change', function() {{
+          if (!inp.checked) return;
+          var group = inp.closest('.visual-label-group');
+          if (!group) return;
+          group.querySelectorAll('input[type="checkbox"][name="' + inp.name + '"]').forEach(function(other) {{
+            if (other !== inp) other.checked = false;
+          }});
+        }});
+      }});
+    }}
     function syncPhotoAspectChips(photoWrap) {{
       if (!photoWrap) return;
       var detailSel = photoWrap.querySelector('select.photo-detail-select');
@@ -4752,6 +4807,7 @@ def _render_page(
         syncReasonDomains(form);
       }});
     }}
+    bindVisualLabelChoices(document);
     bindReasonDomains(document);
     document.querySelectorAll('.photo-detail-wrap').forEach(function(wrap) {{
       var ds = wrap.querySelector('select.photo-detail-select');
@@ -4778,6 +4834,7 @@ def _render_page(
       bind(pos, neg);
       bind(neg, pos);
       form.addEventListener('submit', function(ev) {{
+        if (form.classList.contains('visual-review-form')) return;
         var submitter = ev.submitter;
         if (!submitter || submitter.getAttribute('formaction') === '/agree' || submitter.getAttribute('formaction') === '/skip') return;
         if (!requireReasonDomains(form)) {{
@@ -5298,6 +5355,7 @@ def _render_page(
 
     function _initReviewCard(root) {{
       _bindSimilarButtons(root);
+      bindVisualLabelChoices(root);
       bindReasonDomains(root);
       root.querySelectorAll('.photo-detail-wrap').forEach(function(wrap) {{
         var ds = wrap.querySelector('select.photo-detail-select');

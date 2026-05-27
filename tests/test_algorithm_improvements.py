@@ -1241,6 +1241,22 @@ class AlgorithmImprovementTests(unittest.TestCase):
         self.assertEqual(model_training._photo_training_label(visual_row), 0)
         self.assertIsNone(model_training._photo_training_label(neutral_row))
 
+    def test_visual_review_uses_checkbox_chips(self):
+        row = {
+            "review_id": "rv-1",
+            "name": "Ana",
+            "age": "25",
+            "label": "CURTIR",
+            "photo_url": "https://example.com/a.jpg",
+        }
+
+        html = review_ui._render_visual_review_card(row, {})
+
+        self.assertIn('class="review-form visual-review-form"', html)
+        self.assertIn('type="checkbox" name="visual_face_label" value="positive"', html)
+        self.assertIn('type="checkbox" name="visual_overall_label" value="negative"', html)
+        self.assertNotIn('<select name="visual_face_label"', html)
+
     def test_photo_deep_feedback_gets_visual_training_weight(self):
         import pandas as pd
 
